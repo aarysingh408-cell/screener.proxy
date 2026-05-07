@@ -216,7 +216,18 @@ def debug_raw():
         "first_500": html[:500]
     })
 
-
+@app.route("/debug-slice")
+def debug_slice():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    idx = html.find("top-ratios")
+    if idx == -1:
+        return jsonify({"error": "top-ratios not found"})
+    return jsonify({
+        "slice": html[idx:idx+3000]
+    })
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "cookie_set": bool(COOKIE)})
