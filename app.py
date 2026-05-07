@@ -61,7 +61,7 @@ def parse_top_ratios(html):
         texts = [t for t in texts if t]  # remove empty
 
         if len(texts) < 2:
-                    continue
+            continue
 
         name = texts[0]
         val  = texts[-1]  # last span is usually the value
