@@ -27,54 +27,64 @@ def fetch_screener(ticker):
             if "top-ratios" in r.text:
                 cache[ticker] = r.text
                 return r.text
-        except Exception as e:
+        except Exception:
             continue
     return None
 
 # ── PARSE TOP RATIOS ──────────────────────────────────────────
 def parse_top_ratios(html):
     result = {}
-    sec = re.search(r'id="top-ratios"[^>]*>(.*?)', html, re.S|re.I)
+
+    # Step 1: find the top-ratios section
+    # Try multiple patterns to find the UL
+    sec = None
+    patterns = [
+        r'id=["\']top-ratios["\'][^>]*>(.*?)',
+        r'top-ratios[^>]*>(.*?)',
+        r'id="top-ratios"(.*?)',
+    ]
+    for p in patterns:
+        m = re.search(p, html, re.S | re.I)
+        if m:
+            sec = m.group(1)
+            break
+
     if not sec:
         return result
 
-    items = re.findall(r']*>(.*?)', sec.group(1), re.S|re.I)
-    for item in items:
-        # Get label
-        nm = (re.search(r'class="name"[^>]*>(.*?)',         item, re.S|re.I) or
-              re.search(r'class="[^"]*name[^"]*"[^>]*>(.*?)', item, re.S|re.I))
-        if not nm:
-            continue
-        name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
-        if not name:
+    # Step 2: find all li elements
+    items = re.findall(r']*>(.*?)', sec, re.S | re.I)
+    if not items:
+        # Try without strict li tags
+        items = sec.split(']*>(.*?)', item, re.S | re.I)
+        texts = [re.sub(r'<[^>]+>', '', s).strip() for s in spans]
+        texts = [t for t in texts if t]  # remove empty
+
+        if len(texts) < 2:
             continue
 
-        # Get value — Screener uses class="number" on value spans
-        vl = (re.search(r'class="number"[^>]*>(.*?)',          item, re.S|re.I) or
-              re.search(r'class="[^"]*number[^"]*"[^>]*>(.*?)', item, re.S|re.I) or
-              re.search(r'class="value"[^>]*>(.*?)',            item, re.S|re.I) or
-              re.search(r'class="[^"]*value[^"]*"[^>]*>(.*?)',  item, re.S|re.I))
-        if not vl:
-            continue
+        name = texts[0]
+        val  = texts[-1]  # last span is usually the value
 
-        raw  = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
-        raw  = re.sub(r'[₹%,\s]', '', raw)
+        # Clean value
+        raw  = re.sub(r'[₹%,\s]', '', val)
         nums = re.findall(r'[\d.]+', raw)
         key  = re.sub(r'[\s/\-]', '', name).lower()
 
-        result[key]              = float(nums[0]) if nums else raw
-        result['_label_' + key] = name  # original label for debugging
+        if key:
+            result[key]              = float(nums[0]) if nums else raw
+            result['_label_' + key] = name
 
     return result
 
-# ── PARSE TTM VALUE FROM P&L TABLE ────────────────────────────
+# ── PARSE TTM FROM P&L TABLE ──────────────────────────────────
 def parse_ttm(html, row_label):
     pattern = re.compile(
-        r']*>.*?' + re.escape(row_label) + r'.*?', re.S|re.I)
+        r']*>.*?' + re.escape(row_label) + r'.*?', re.S | re.I)
     m = pattern.search(html)
     if not m:
         return None
-    cells = re.findall(r']*>(.*?)', m.group(0), re.S|re.I)
+    cells = re.findall(r']*>(.*?)', m.group(0), re.S | re.I)
     if not cells:
         return None
     last = re.sub(r'<[^>]+>', '', cells[-1]).replace(',', '').strip()
@@ -86,8 +96,8 @@ def parse_ttm(html, row_label):
 # ── PARSE HISTORICAL ROCE ─────────────────────────────────────
 def parse_roce_by_year(html, year):
     patterns = [
-        re.compile(r'ROCE[^<]{0,200}?' + str(year) + r'[^<]{0,100}?([\d.]+)', re.S|re.I),
-        re.compile(str(year) + r'[^<]{0,300}?ROCE[^<]{0,100}?([\d.]+)',        re.S|re.I),
+        re.compile(r'ROCE[^<]{0,200}?' + str(year) + r'[^<]{0,100}?([\d.]+)', re.S | re.I),
+        re.compile(str(year) + r'[^<]{0,300}?ROCE[^<]{0,100}?([\d.]+)',        re.S | re.I),
     ]
     for p in patterns:
         m = p.search(html)
@@ -95,7 +105,7 @@ def parse_roce_by_year(html, year):
             return float(m.group(1))
     return None
 
-# ── METRIC → SCREENER LABEL MAP ───────────────────────────────
+# ── METRIC MAP ────────────────────────────────────────────────
 METRIC_MAP = {
     "MARKETCAP"      : "marketcap",
     "BOOKVALUE"      : "bookvalue",
@@ -124,7 +134,7 @@ METRIC_MAP = {
 @app.route("/stock")
 def stock():
     ticker = request.args.get("ticker", "").upper().strip()
-    metric = request.args.get("metric", "").upper().replace(" ","").replace("_","")
+    metric = request.args.get("metric", "").upper().replace(" ", "").replace("_", "")
 
     if not ticker or not metric:
         return jsonify({"error": "ticker and metric required"}), 400
@@ -135,7 +145,6 @@ def stock():
 
     ratios = parse_top_ratios(html)
 
-    # PB = Price / Book Value
     if metric == "PB":
         price = ratios.get("currentprice")
         bv    = ratios.get("bookvalue")
@@ -143,29 +152,67 @@ def stock():
             return jsonify({"value": round(float(price) / float(bv), 2)})
         return jsonify({"value": "N/A"})
 
-    # TTM Sales
     if metric == "SALESTTM":
         v = parse_ttm(html, "Sales")
         return jsonify({"value": v if v is not None else "N/A"})
 
-    # TTM PAT
     if metric == "PATTTM":
         v = parse_ttm(html, "Net Profit")
         return jsonify({"value": v if v is not None else "N/A"})
 
-    # Historical ROCE by FY
     if metric in ("ROCE2023", "ROCE2024", "ROCE2025"):
         year = metric.replace("ROCE", "")
         v    = parse_roce_by_year(html, year)
         return jsonify({"value": v if v is not None else "N/A"})
 
-    # All other metrics from top-ratios
     lookup = METRIC_MAP.get(metric)
     if not lookup:
         return jsonify({"error": f"Unknown metric: {metric}"}), 400
 
     value = ratios.get(lookup, "N/A")
     return jsonify({"value": value})
+
+
+@app.route("/debug-section")
+def debug_section():
+    """Shows raw HTML of the top-ratios section so we can see exact structure"""
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html   = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+
+    # Find top-ratios section
+    m = re.search(r'id=["\']top-ratios["\'][^>]*>(.*?)', html, re.S | re.I)
+    if not m:
+        # Show surrounding context
+        idx = html.find("top-ratios")
+        return jsonify({
+            "found"  : False,
+            "context": html[max(0,idx-100):idx+500] if idx != -1 else "NOT FOUND"
+        })
+
+    section = m.group(1)
+    return jsonify({
+        "found"          : True,
+        "section_length" : len(section),
+        "section_html"   : section[:2000]  # first 2000 chars
+    })
+
+
+@app.route("/debug-labels")
+def debug_labels():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html   = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    ratios = parse_top_ratios(html)
+    labels = {k.replace('_label_', ''): v
+              for k, v in ratios.items()
+              if k.startswith('_label_')}
+    return jsonify({
+        "total_found": len(labels),
+        "labels"     : labels
+    })
 
 
 @app.route("/debug-raw")
@@ -177,30 +224,14 @@ def debug_raw():
     return jsonify({
         "length"         : len(html),
         "has_top_ratios" : "top-ratios" in html,
-        "has_login"      : "login" in html.lower() or "sign in" in html.lower(),
+        "has_login"      : "login" in html.lower(),
         "first_500"      : html[:500]
     })
 
 
-@app.route("/debug-labels")
-def debug_labels():
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    html   = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html returned — check cookie"})
-    ratios = parse_top_ratios(html)
-    if not ratios:
-        return jsonify({"error": "parsed empty — parser not finding labels"})
-    labels = {k.replace('_label_', ''): v
-              for k, v in ratios.items()
-              if k.startswith('_label_')}
-    return jsonify({"total_found": len(labels), "labels": labels})
-
-
 @app.route("/health")
 def health():
-    cookie_set = bool(COOKIE)
-    return jsonify({"status": "ok", "cookie_set": cookie_set})
+    return jsonify({"status": "ok", "cookie_set": bool(COOKIE)})
 
 
 if __name__ == "__main__":
