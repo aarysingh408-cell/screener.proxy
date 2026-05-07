@@ -29,22 +29,36 @@ def fetch_screener(ticker):
 
 def parse_top_ratios(html):
     result = {}
-    sec = re.search(r']*id="top-ratios"[^>]*>(.*?)', html, re.S|re.I)
+    sec = re.search(r'id="top-ratios"[^>]*>(.*?)</ul>', html, re.S|re.I)
     if not sec:
         return result
-    for li in re.findall(r']*>(.*?)', sec.group(1), re.S|re.I):
-        nm = re.search(r'class="[^"]*name[^"]*"[^>]*>(.*?)', li, re.S|re.I)
-        vl = re.search(r'class="[^"]*number[^"]*"[^>]*>(.*?)', li, re.S|re.I) or \
-             re.search(r'class="[^"]*value[^"]*"[^>]*>(.*?)',  li, re.S|re.I)
-        if not nm or not vl:
+    
+    items = re.findall(r'<li[^>]*>(.*?)</li>', sec.group(1), re.S|re.I)
+    for item in items:
+        # Get name
+        nm = re.search(r'class="name"[^>]*>(.*?)</span>', item, re.S|re.I)
+        if not nm:
+            nm = re.search(r'<span[^>]*>(.*?)</span>', item, re.S|re.I)
+        if not nm:
             continue
+            
         name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
+        
+        # Get value - try multiple class names Screener uses
+        vl = (re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S|re.I) or
+              re.search(r'class="value"[^>]*>(.*?)</span>',  item, re.S|re.I) or
+              re.search(r'class="[^"]*number[^"]*"[^>]*>(.*?)</span>', item, re.S|re.I))
+        if not vl:
+            continue
+            
         raw  = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
         raw  = re.sub(r'[₹%,\s]', '', raw)
         nums = re.findall(r'[\d.]+', raw)
         key  = re.sub(r'[\s/\-]', '', name).lower()
+        
         result[key] = float(nums[0]) if nums else raw
-        result['_label_' + key] = name  # store original label for debug
+        result['_label_' + key] = name
+
     return result
 
 def parse_ttm(html, row_label):
@@ -165,3 +179,14 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    @app.route("/debug-labels")
+def debug_labels():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html   = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    ratios = parse_top_ratios(html)
+    labels = {k.replace('_label_',''): v 
+              for k, v in ratios.items() 
+              if k.startswith('_label_')}
+    return jsonify(labels)
