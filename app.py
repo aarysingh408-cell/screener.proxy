@@ -35,11 +35,11 @@ def fetch_screener(ticker):
     return None
 
 
-def extract_section(html):
-    marker = 'id="top-ratios"'
+def extract_ul_section(html, section_id):
+    marker = 'id="' + section_id + '"'
     start = html.find(marker)
     if start == -1:
-        marker = "id='top-ratios'"
+        marker = "id='" + section_id + "'"
         start = html.find(marker)
     if start == -1:
         return ""
@@ -64,9 +64,8 @@ def extract_section(html):
     return ""
 
 
-def parse_top_ratios(html):
+def parse_ul_section(section):
     result = {}
-    section = extract_section(html)
     if not section:
         return result
     items = re.findall(r'<li[^>]*>(.*?)</li>', section, re.S | re.I)
@@ -81,10 +80,50 @@ def parse_top_ratios(html):
         if not vl:
             continue
         raw = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
-        raw = re.sub(r'[₹%,\s]', '', raw)
+        raw = re.sub(r'[,\s]', '', raw)
         nums = re.findall(r'[\d.]+', raw)
         key = re.sub(r'[\s/\-]', '', name).lower()
         if key:
+            result[key] = float(nums[0]) if nums else raw
+            result['_label_' + key] = name
+    return result
+
+
+def parse_all_ratios(html):
+    result = {}
+    # Parse default top-ratios section
+    section1 = extract_ul_section(html, "top-ratios")
+    result.update(parse_ul_section(section1))
+    # Find ALL other ul sections in the page that contain ratio data
+    # Screener puts quick/custom ratios in separate ul blocks
+    all_ul_ids = re.findall(r'<ul[^>]*id=["\']([^"\']+)["\']', html, re.I)
+    for uid in all_ul_ids:
+        if uid == "top-ratios":
+            continue
+        if any(x in uid.lower() for x in ["ratio", "quick", "user", "metric", "data"]):
+            section = extract_ul_section(html, uid)
+            result.update(parse_ul_section(section))
+    # Also try to find ratio li items outside of known sections
+    # by scanning for li items with class="flex flex-space-between"
+    extra_items = re.findall(
+        r'<li[^>]*class="[^"]*flex[^"]*space[^"]*between[^"]*"[^>]*>(.*?)</li>',
+        html, re.S | re.I
+    )
+    for item in extra_items:
+        nm = re.search(r'class="name"[^>]*>(.*?)</span>', item, re.S | re.I)
+        if not nm:
+            continue
+        name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
+        if not name:
+            continue
+        vl = re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S | re.I)
+        if not vl:
+            continue
+        raw = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
+        raw = re.sub(r'[,\s]', '', raw)
+        nums = re.findall(r'[\d.]+', raw)
+        key = re.sub(r'[\s/\-]', '', name).lower()
+        if key and key not in result:
             result[key] = float(nums[0]) if nums else raw
             result['_label_' + key] = name
     return result
@@ -115,28 +154,34 @@ def parse_roce_by_year(html, year):
     return None
 
 
+# Based on exact labels visible in screenshot
 METRIC_MAP = {
-    "MARKETCAP": "marketcap",
-    "BOOKVALUE": "bookvalue",
-    "PE": "stockpe",
-    "ROE": "roe",
-    "ROCE": "roce",
-    "DIVIDENDYIELD": "dividendyield",
-    "PRICE": "currentprice",
-    "SALESGROWTH3Y": "salesgrowth3years",
-    "SALESGROWTH5Y": "salesgrowth5years",
-    "SALESGROWTH10Y": "salesvar10yrs",
-    "PROFITGROWTH3Y": "profitvar3yrs",
-    "PROFITGROWTH5Y": "profitvar5yrs",
+    "MARKETCAP":       "marketcap",
+    "BOOKVALUE":       "bookvalue",
+    "PE":              "stockpe",
+    "ROE":             "roe",
+    "ROCE":            "roce",
+    "DIVIDENDYIELD":   "dividendyield",
+    "PRICE":           "currentprice",
+    # Sales growth — exact labels from screenshot
+    "SALESGROWTH3Y":   "salesgrowth3years",
+    "SALESGROWTH5Y":   "salesgrowth5years",
+    "SALESGROWTH10Y":  "salesvar10yrs",
+    # Profit growth — exact labels from screenshot
+    "PROFITGROWTH3Y":  "profitvar3yrs",
+    "PROFITGROWTH5Y":  "profitvar5yrs",
     "PROFITGROWTH10Y": "profitvar10yrs",
-    "ROE3Y": "roe3yr",
-    "ROE5Y": "roe5yr",
-    "ROE10Y": "roe10yr",
-    "CAGR3Y": "3years",
-    "CAGR5Y": "5years",
-    "CAGR10Y": "10years",
-    "FII": "fiiholding",
-    "DII": "diiholding",
+    # ROE averages — exact labels from screenshot
+    "ROE3Y":           "roe3yr",
+    "ROE5Y":           "roe5yr",
+    "ROE10Y":          "roe10yr",
+    # Stock returns / CAGR — exact labels from screenshot
+    "CAGR3Y":          "returnover3years",
+    "CAGR5Y":          "returnover5years",
+    "CAGR10Y":         "returnover10years",
+    # Ownership — exact labels from screenshot
+    "FII":             "fiiholding",
+    "DII":             "diiholding",
 }
 
 
@@ -149,7 +194,7 @@ def stock():
     html = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "Could not fetch Screener - check cookie"}), 503
-    ratios = parse_top_ratios(html)
+    ratios = parse_all_ratios(html)
     if metric == "PB":
         price = ratios.get("currentprice")
         bv = ratios.get("bookvalue")
@@ -179,10 +224,20 @@ def debug_labels():
     html = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
-    ratios = parse_top_ratios(html)
+    ratios = parse_all_ratios(html)
     labels = {k.replace('_label_', ''): v for k, v in ratios.items() if k.startswith('_label_')}
     values = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
     return jsonify({"total_found": len(labels), "labels": labels, "values": values})
+
+
+@app.route("/debug-ul-ids")
+def debug_ul_ids():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    ids = re.findall(r'<ul[^>]*id=["\']([^"\']+)["\']', html, re.I)
+    return jsonify({"ul_ids": ids})
 
 
 @app.route("/debug-slice")
@@ -195,16 +250,6 @@ def debug_slice():
     if idx == -1:
         return jsonify({"error": "top-ratios not found"})
     return jsonify({"slice": html[idx:idx + 3000]})
-
-
-@app.route("/debug-section")
-def debug_section():
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-    section = extract_section(html)
-    return jsonify({"found": bool(section), "section_length": len(section), "section_html": section[:2000]})
 
 
 @app.route("/health")
