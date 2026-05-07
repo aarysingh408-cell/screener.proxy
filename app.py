@@ -8,8 +8,8 @@ from cachetools import TTLCache
 app = Flask(__name__)
 cache = TTLCache(maxsize=100, ttl=1800)
 
-COOKIE      = os.environ.get("SCREENER_COOKIE", "")
-GROQ_KEY    = os.environ.get("GROQ_API_KEY", "")
+COOKIE   = os.environ.get("SCREENER_COOKIE", "")
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -28,7 +28,6 @@ API_HEADERS = {
 }
 
 
-# ── FETCH ─────────────────────────────────────────────────────
 def fetch_screener(ticker):
     if ticker in cache:
         return cache[ticker]
@@ -65,84 +64,53 @@ def fetch_quick_ratios(company_id):
     return None
 
 
-# ── EXTRACT READABLE TEXT FROM HTML ──────────────────────────
-def extract_ratio_text(html, qr_html):
-    lines = []
-    for fragment in [html, qr_html or ""]:
-        items = re.findall(r'<li[^>]*>(.*?)</li>', fragment, re.S | re.I)
-        for item in items:
-            nm = re.search(r'class="name"[^>]*>(.*?)</span>', item, re.S | re.I)
-            vl = re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S | re.I)
-            if nm and vl:
-                name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
-                val  = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
-                if name and val:
-                    lines.append(name + ": " + val)
-    return "\n".join(lines)
+def fetch_shareholding(company_id):
+    key = "sh_" + str(company_id)
+    if key in cache:
+        return cache[key]
+    # Try multiple Screener shareholding endpoints
+    endpoints = [
+        "/api/company/" + company_id + "/shareholding/",
+        "/api/company/" + company_id + "/shareholding/?period=quarterly",
+        "/api/company/" + company_id + "/shareholding/?period=annual",
+    ]
+    for ep in endpoints:
+        try:
+            r = requests.get("https://www.screener.in" + ep,
+                             headers=API_HEADERS, timeout=15)
+            if r.status_code == 200 and len(r.text) > 100:
+                cache[key] = r.text
+                return r.text, ep
+        except Exception:
+            pass
+    return None, None
 
 
-# ── GROQ EXTRACTION ───────────────────────────────────────────
-def extract_via_groq(ratio_text):
-    if not GROQ_KEY:
-        return None
-
-    prompt = """You are a financial data extractor. Below is raw metric data from Screener.in for an Indian stock.
-Extract EXACTLY these metrics and return ONLY a JSON object with numeric values (no units, no % sign).
-If a metric is not found, use null.
-
-Metrics to extract:
-- MarketCap (in Crores)
-- Price (current price)
-- PE (Stock P/E)
-- BookValue
-- ROE (current)
-- ROCE (current)
-- DividendYield
-- SalesGrowth3Y
-- SalesGrowth5Y
-- SalesGrowth10Y
-- ProfitGrowth3Y
-- ProfitGrowth5Y
-- ProfitGrowth10Y
-- ROE3Y
-- ROE5Y
-- ROE10Y
-- CAGR3Y (Return over 3years)
-- CAGR5Y (Return over 5years)
-- CAGR10Y (Return over 10years)
-- FII
-- DII
-
-Raw data:
-""" + ratio_text + """
-
-Return only valid JSON, no explanation, no markdown.
-Example: {"MarketCap": 194500, "Price": 1436, "PE": 24.0, ...}"""
-
-    try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": "Bearer " + GROQ_KEY,
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
-                "max_tokens": 500
-            },
-            timeout=15
-        )
-        content = r.json()["choices"][0]["message"]["content"].strip()
-        content = re.sub(r'^```[a-z]*\n?', '', content)
-        content = re.sub(r'\n?```$', '', content)
-        return json.loads(content)
-    except Exception as e:
-        return None
+def extract_ul_section(html, section_id):
+    start = html.find('id="' + section_id + '"')
+    if start == -1:
+        return ""
+    open_end = html.find('>', start)
+    if open_end == -1:
+        return ""
+    pos = open_end + 1
+    depth = 1
+    while pos < len(html) and depth > 0:
+        next_open  = html.find('<ul', pos)
+        next_close = html.find('</ul>', pos)
+        if next_close == -1:
+            break
+        if next_open != -1 and next_open < next_close:
+            depth += 1
+            pos = next_open + 3
+        else:
+            depth -= 1
+            if depth == 0:
+                return html[open_end + 1:next_close]
+            pos = next_close + 5
+    return ""
 
 
-# ── FALLBACK DIRECT PARSER ────────────────────────────────────
 def clean_number(raw):
     raw = re.sub(r'<[^>]+>', '', raw).strip()
     raw = re.sub(r'[₹\s,]', '', raw)
@@ -176,44 +144,57 @@ def parse_li_items(html_fragment):
     return result
 
 
-def extract_ul_section(html, section_id):
-    start = html.find('id="' + section_id + '"')
-    if start == -1:
-        return ""
-    open_end = html.find('>', start)
-    if open_end == -1:
-        return ""
-    pos = open_end + 1
-    depth = 1
-    while pos < len(html) and depth > 0:
-        next_open  = html.find('<ul', pos)
-        next_close = html.find('</ul>', pos)
-        if next_close == -1:
+def parse_insights_roe(html):
+    """
+    Extract ROE averages from Screener's key insights text.
+    Example: 'return on equity of 8.91% over last 3 years'
+    Confirmed present in page HTML from earlier debug.
+    """
+    result = {}
+    patterns = [
+        (r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*3\s*years?', 'roe3yr'),
+        (r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*5\s*years?', 'roe5yr'),
+        (r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*10\s*years?', 'roe10yr'),
+    ]
+    for pattern, key in patterns:
+        m = re.search(pattern, html, re.I)
+        if m:
+            result[key] = float(m.group(1))
+    return result
+
+
+def parse_fii_dii_from_html(html):
+    """
+    Try to extract FII/DII from shareholding section in HTML.
+    Screener embeds some shareholding data in the page for charts.
+    """
+    result = {}
+
+    # Try JSON data embedded in script tags
+    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.S | re.I)
+    for script in scripts:
+        # Look for FII percentage in JSON
+        fii_m = re.search(r'["\'](?:FII|Foreign Institutional)["\'].*?:\s*["\']?([\d.]+)', script, re.I)
+        dii_m = re.search(r'["\'](?:DII|Domestic Institutional)["\'].*?:\s*["\']?([\d.]+)', script, re.I)
+        if fii_m:
+            result['fiiholding'] = float(fii_m.group(1))
+        if dii_m:
+            result['diiholding'] = float(dii_m.group(1))
+        if result:
             break
-        if next_open != -1 and next_open < next_close:
-            depth += 1
-            pos = next_open + 3
-        else:
-            depth -= 1
-            if depth == 0:
-                return html[open_end + 1:next_close]
-            pos = next_close + 5
-    return ""
 
+    # Try shareholding table in HTML
+    if 'fiiholding' not in result:
+        fii_m = re.search(r'FII[^<]{0,50}?</td>\s*<td[^>]*>\s*([\d.]+)', html, re.I)
+        if fii_m:
+            result['fiiholding'] = float(fii_m.group(1))
 
-DIRECT_MAP = {
-    "MARKETCAP": "marketcap", "BOOKVALUE": "bookvalue",
-    "PE": "stockpe", "ROE": "roe", "ROCE": "roce",
-    "DIVIDENDYIELD": "dividendyield", "PRICE": "currentprice",
-    "SALESGROWTH3Y": "salesgrowth3years", "SALESGROWTH5Y": "salesgrowth5years",
-    "SALESGROWTH10Y": "salesvar10yrs",
-    "PROFITGROWTH3Y": "profitvar3yrs", "PROFITGROWTH5Y": "profitvar5yrs",
-    "PROFITGROWTH10Y": "profitvar10yrs",
-    "ROE3Y": "roe3yr", "ROE5Y": "roe5yr", "ROE10Y": "roe10yr",
-    "CAGR3Y": "returnover3years", "CAGR5Y": "returnover5years",
-    "CAGR10Y": "returnover10years",
-    "FII": "fiiholding", "DII": "diiholding",
-}
+    if 'diiholding' not in result:
+        dii_m = re.search(r'DII[^<]{0,50}?</td>\s*<td[^>]*>\s*([\d.]+)', html, re.I)
+        if dii_m:
+            result['diiholding'] = float(dii_m.group(1))
+
+    return result
 
 
 def parse_ttm(html, row_label):
@@ -242,7 +223,48 @@ def parse_roce_by_year(html, year):
     return None
 
 
-# ── MAIN ROUTE ────────────────────────────────────────────────
+def get_all_ratios(ticker):
+    html = fetch_screener(ticker)
+    if not html:
+        return {}
+
+    # Start with top-ratios (9 confirmed correct metrics)
+    result = parse_li_items(extract_ul_section(html, "top-ratios"))
+
+    # Add quick_ratios from API (sales growth, profit growth, returns)
+    company_id = get_company_id(html)
+    if company_id:
+        qr_html = fetch_quick_ratios(company_id)
+        if qr_html:
+            result.update(parse_li_items(qr_html))
+
+    # Override ROE 3/5/10Yr with values from insights text
+    # (confirmed more accurate than quick_ratios API)
+    insights_roe = parse_insights_roe(html)
+    result.update(insights_roe)
+
+    # Try FII/DII from HTML
+    fii_dii = parse_fii_dii_from_html(html)
+    result.update(fii_dii)
+
+    return result
+
+
+METRIC_MAP = {
+    "MARKETCAP": "marketcap", "BOOKVALUE": "bookvalue",
+    "PE": "stockpe", "ROE": "roe", "ROCE": "roce",
+    "DIVIDENDYIELD": "dividendyield", "PRICE": "currentprice",
+    "SALESGROWTH3Y": "salesgrowth3years", "SALESGROWTH5Y": "salesgrowth5years",
+    "SALESGROWTH10Y": "salesvar10yrs",
+    "PROFITGROWTH3Y": "profitvar3yrs", "PROFITGROWTH5Y": "profitvar5yrs",
+    "PROFITGROWTH10Y": "profitvar10yrs",
+    "ROE3Y": "roe3yr", "ROE5Y": "roe5yr", "ROE10Y": "roe10yr",
+    "CAGR3Y": "returnover3years", "CAGR5Y": "returnover5years",
+    "CAGR10Y": "returnover10years",
+    "FII": "fiiholding", "DII": "diiholding",
+}
+
+
 @app.route("/stock")
 def stock():
     ticker = request.args.get("ticker", "").upper().strip()
@@ -254,10 +276,6 @@ def stock():
     if not html:
         return jsonify({"error": "Could not fetch Screener"}), 503
 
-    company_id = get_company_id(html)
-    qr_html    = fetch_quick_ratios(company_id) if company_id else None
-
-    # TTM and historical ROCE bypass Groq
     if metric == "SALESTTM":
         return jsonify({"value": parse_ttm(html, "Sales") or "N/A"})
     if metric == "PATTTM":
@@ -266,32 +284,70 @@ def stock():
         v = parse_roce_by_year(html, metric.replace("ROCE", ""))
         return jsonify({"value": v or "N/A"})
 
-    # PB is calculated
+    ratios = get_all_ratios(ticker)
+
     if metric == "PB":
-        direct = parse_li_items(extract_ul_section(html, "top-ratios"))
-        price = direct.get("currentprice")
-        bv    = direct.get("bookvalue")
+        price = ratios.get("currentprice")
+        bv    = ratios.get("bookvalue")
         if price and bv and float(bv) != 0:
             return jsonify({"value": round(float(price) / float(bv), 2)})
         return jsonify({"value": "N/A"})
 
-    # Try Groq first if key is set
-    if GROQ_KEY:
-        ratio_text = extract_ratio_text(html, qr_html)
-        groq_data  = extract_via_groq(ratio_text)
-        if groq_data and metric in groq_data and groq_data[metric] is not None:
-            return jsonify({"value": groq_data[metric], "source": "groq"})
-
-    # Fallback to direct parser
-    ratios = parse_li_items(extract_ul_section(html, "top-ratios"))
-    if qr_html:
-        ratios.update(parse_li_items(qr_html))
-
-    lookup = DIRECT_MAP.get(metric)
+    lookup = METRIC_MAP.get(metric)
     if not lookup:
         return jsonify({"error": "Unknown metric: " + metric}), 400
 
     return jsonify({"value": ratios.get(lookup, "N/A")})
+
+
+@app.route("/debug-labels")
+def debug_labels():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html   = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+
+    ratios = get_all_ratios(ticker)
+    values = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
+
+    # Also test shareholding API endpoints
+    company_id = get_company_id(html)
+    sh_data, sh_ep = fetch_shareholding(company_id) if company_id else (None, None)
+
+    return jsonify({
+        "values": values,
+        "roe_from_insights": parse_insights_roe(html),
+        "fii_dii_from_html": parse_fii_dii_from_html(html),
+        "shareholding_endpoint": sh_ep,
+        "shareholding_preview": sh_data[:500] if sh_data else None
+    })
+
+
+@app.route("/debug-shareholding")
+def debug_shareholding():
+    ticker     = request.args.get("ticker", "RELIANCE").upper()
+    html       = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    company_id = get_company_id(html)
+    if not company_id:
+        return jsonify({"error": "no company id"})
+
+    results = {}
+    endpoints = [
+        "/api/company/" + company_id + "/shareholding/",
+        "/api/company/" + company_id + "/shareholding/?period=quarterly",
+        "/api/company/" + company_id + "/shareholding/?period=annual",
+        "/company/" + ticker + "/shareholding/",
+    ]
+    for ep in endpoints:
+        try:
+            r = requests.get("https://www.screener.in" + ep,
+                             headers=API_HEADERS, timeout=10)
+            results[ep] = {"status": r.status_code, "preview": r.text[:300]}
+        except Exception as e:
+            results[ep] = {"error": str(e)}
+    return jsonify(results)
 
 
 @app.route("/clear-cache")
@@ -300,36 +356,9 @@ def clear_cache():
     return jsonify({"status": "cache cleared"})
 
 
-@app.route("/debug-labels")
-def debug_labels():
-    ticker  = request.args.get("ticker", "RELIANCE").upper()
-    html    = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-    company_id = get_company_id(html)
-    qr_html    = fetch_quick_ratios(company_id) if company_id else None
-    ratio_text = extract_ratio_text(html, qr_html)
-
-    # Show what Groq would receive
-    direct = parse_li_items(extract_ul_section(html, "top-ratios"))
-    if qr_html:
-        direct.update(parse_li_items(qr_html))
-    values = {k: v for k, v in direct.items() if not k.startswith('_label_')}
-
-    return jsonify({
-        "ratio_text_for_groq": ratio_text,
-        "direct_parsed_values": values,
-        "groq_key_set": bool(GROQ_KEY)
-    })
-
-
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "cookie_set": bool(COOKIE),
-        "groq_key_set": bool(GROQ_KEY)
-    })
+    return jsonify({"status": "ok", "cookie_set": bool(COOKIE), "groq_key_set": bool(GROQ_KEY)})
 
 
 if __name__ == "__main__":
