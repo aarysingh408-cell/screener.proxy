@@ -363,7 +363,32 @@ def debug_roe_table():
 
     return jsonify(results)
 
-
+@app.route("/debug-roe-raw")
+def debug_roe_raw():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html   = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    
+    # Find every occurrence of ROE-related text and show context
+    results = []
+    search_terms = ["Return on equity", "return-on-equity", "roe", "ROE"]
+    for term in search_terms:
+        idx = 0
+        count = 0
+        while count < 3:
+            idx = html.find(term, idx)
+            if idx == -1:
+                break
+            results.append({
+                "term": term,
+                "position": idx,
+                "context": html[max(0, idx-100):idx+400]
+            })
+            idx += len(term)
+            count += 1
+    
+    return jsonify({"results": results[:8]})
 @app.route("/clear-cache")
 def clear_cache():
     cache.clear()
