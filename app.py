@@ -122,43 +122,99 @@ def parse_li_items(html_fragment):
     return result
 
 
-def parse_insights(html):
-    """
-    Extract metrics from Screener's key insights sentences.
-    ROE 3Yr confirmed working. Searching for 5Yr/10Yr and FII/DII patterns.
-    """
+def parse_roe_from_insights(html):
+    """ROE 3Yr confirmed in pros/cons. Extend to 5/10Yr with broader pattern."""
     result = {}
-
-    # ROE averages
     for years, key in [("3", "roe3yr"), ("5", "roe5yr"), ("10", "roe10yr")]:
         m = re.search(
-            r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*' + years + r'\s*years?',
+            r'return on equity of ([\d.]+)%[^<]{0,50}?' + years + r'\s*years?',
             html, re.I)
         if m:
             result[key] = float(m.group(1))
+    return result
 
-    # FII — Screener sometimes embeds FII in meta/insights as "FII holding of X%"
-    fii_patterns = [
-        r'FII\s*holding[^<]{0,30}?([\d.]+)\s*%',
-        r'Foreign\s*Institutional[^<]{0,50}?([\d.]+)\s*%',
-        r'FII[^<]{0,20}?:\s*([\d.]+)',
+
+def parse_roe_from_table(html):
+    """
+    Calculate ROE averages from the annual Key Metrics table.
+    Screener embeds annual ROE% values in a table row labeled 'Return on equity'.
+    Average the last 3, 5, 10 years to compute ROE 3Yr, 5Yr, 10Yr.
+    """
+    result = {}
+
+    # Find the row containing "Return on equity" in a table
+    patterns = [
+        r'Return on equity\s*%?(.*?)</tr>',
+        r'ROE\s*%?(.*?)</tr>',
     ]
-    for p in fii_patterns:
-        m = re.search(p, html, re.I)
-        if m:
-            result['fiiholding'] = float(m.group(1))
+
+    for pattern in patterns:
+        m = re.search(pattern, html, re.S | re.I)
+        if not m:
+            continue
+
+        row = m.group(1)
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
+        values = []
+        for cell in cells:
+            text = re.sub(r'<[^>]+>', '', cell).replace(',', '').strip()
+            try:
+                v = float(text)
+                if 0 < v < 100:  # sanity check: ROE should be 0-100%
+                    values.append(v)
+            except Exception:
+                pass
+
+        if len(values) >= 3:
+            result['roe3yr']  = round(sum(values[:3])  / min(3,  len(values[:3])),  2)
+        if len(values) >= 5:
+            result['roe5yr']  = round(sum(values[:5])  / min(5,  len(values[:5])),  2)
+        if len(values) >= 10:
+            result['roe10yr'] = round(sum(values[:10]) / min(10, len(values[:10])), 2)
+
+        if result:
             break
 
-    # DII
-    dii_patterns = [
-        r'DII\s*holding[^<]{0,30}?([\d.]+)\s*%',
-        r'Domestic\s*Institutional[^<]{0,50}?([\d.]+)\s*%',
-        r'DII[^<]{0,20}?:\s*([\d.]+)',
+    return result
+
+
+def parse_fii_dii_from_charts(html):
+    """
+    Screener embeds shareholding chart data as JSON in script tags.
+    Look for patterns like [{"name":"Promoters","y":...},{"name":"FII","y":...}]
+    """
+    result = {}
+
+    # Pattern 1: highcharts/chart data JSON
+    chart_patterns = [
+        r'\{[^{}]*["\'](?:FII|Foreign Inst)["\'][^{}]*["\']y["\'][^{}]*?([\d.]+)',
+        r'["\'](?:FII|Foreign Inst)["\'][^,]{0,50}?[\d.]+[^,]{0,10}?([\d.]+)',
+        r'FII["\'][^}]{0,100}?["\']y["\'][^}]{0,20}?([\d.]+)',
     ]
-    for p in dii_patterns:
-        m = re.search(p, html, re.I)
-        if m:
-            result['diiholding'] = float(m.group(1))
+
+    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.S | re.I)
+    for script in scripts:
+        if 'FII' not in script and 'Promoter' not in script:
+            continue
+        # Try to find FII value in chart data
+        for p in chart_patterns:
+            m = re.search(p, script, re.I)
+            if m:
+                v = float(m.group(1))
+                if 0 < v < 100:
+                    result['fiiholding'] = v
+                    break
+
+        # Try DII
+        dii_m = re.search(
+            r'["\'](?:DII|Domestic Inst)["\'][^}]{0,100}?["\']y["\'][^}]{0,20}?([\d.]+)',
+            script, re.I)
+        if dii_m:
+            v = float(dii_m.group(1))
+            if 0 < v < 100:
+                result['diiholding'] = v
+
+        if len(result) == 2:
             break
 
     return result
@@ -195,18 +251,30 @@ def get_all_ratios(ticker):
     if not html:
         return {}
 
-    # 1. Default top-ratios (9 confirmed correct)
+    # 1. Top-ratios (confirmed correct)
     result = parse_li_items(extract_ul_section(html, "top-ratios"))
 
-    # 2. Quick ratios API (sales/profit growth, returns)
+    # 2. Quick ratios API (sales/profit growth, returns — mostly correct)
     company_id = get_company_id(html)
     if company_id:
         qr_html = fetch_quick_ratios(company_id)
         if qr_html:
             result.update(parse_li_items(qr_html))
 
-    # 3. Override with insights-parsed values (more accurate for ROE + FII/DII)
-    result.update(parse_insights(html))
+    # 3. ROE averages: try insights first (confirmed for 3Yr)
+    roe_insights = parse_roe_from_insights(html)
+    result.update(roe_insights)
+
+    # 4. ROE averages: fill missing ones from Key Metrics table calculation
+    roe_table = parse_roe_from_table(html)
+    for key in ['roe3yr', 'roe5yr', 'roe10yr']:
+        if key not in result or result.get(key) in [None, "N/A"]:
+            if key in roe_table:
+                result[key] = roe_table[key]
+
+    # 5. FII/DII from chart data embedded in scripts
+    fii_dii = parse_fii_dii_from_charts(html)
+    result.update(fii_dii)
 
     return result
 
@@ -266,39 +334,34 @@ def debug_labels():
     html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
-    ratios  = get_all_ratios(ticker)
-    values  = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
-    insights = parse_insights(html)
+    ratios = get_all_ratios(ticker)
+    values = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
     return jsonify({
         "values": values,
-        "insights_parsed": insights
+        "roe_from_insights": parse_roe_from_insights(html),
+        "roe_from_table":    parse_roe_from_table(html),
+        "fii_dii_from_charts": parse_fii_dii_from_charts(html),
     })
 
 
-@app.route("/debug-insights-raw")
-def debug_insights_raw():
-    """Shows all insight sentences from the page so we can find exact patterns"""
+@app.route("/debug-roe-table")
+def debug_roe_table():
+    """Show raw ROE row from the Key Metrics table"""
     ticker = request.args.get("ticker", "RELIANCE").upper()
     html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
 
-    # Extract all insight list items
-    insights_section = extract_ul_section(html, "key-insights")
-    if not insights_section:
-        # Try finding any insights/pros/cons section
-        idx = html.find("key-insights")
-        if idx == -1:
-            idx = html.find("pros")
-        context = html[max(0, idx-100):idx+3000] if idx != -1 else ""
-        return jsonify({
-            "key_insights_section": "not found with id",
-            "context": context[:2000]
-        })
+    results = {}
+    for label in ["Return on equity", "ROE"]:
+        m = re.search(label + r'\s*%?(.*?)</tr>', html, re.S | re.I)
+        if m:
+            row = m.group(1)
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
+            texts = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+            results[label] = texts[:12]
 
-    items = re.findall(r'<li[^>]*>(.*?)</li>', insights_section, re.S | re.I)
-    texts = [re.sub(r'<[^>]+>', '', item).strip() for item in items]
-    return jsonify({"insight_sentences": texts})
+    return jsonify(results)
 
 
 @app.route("/clear-cache")
