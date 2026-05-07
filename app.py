@@ -28,7 +28,7 @@ def fetch_screener(ticker):
                 cache[ticker] = r.text
                 return r.text
         except Exception:
-            continue
+            continue            
     return None
 
 # ── PARSE TOP RATIOS ──────────────────────────────────────────
