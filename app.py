@@ -8,8 +8,7 @@ from cachetools import TTLCache
 app = Flask(__name__)
 cache = TTLCache(maxsize=100, ttl=1800)
 
-COOKIE   = os.environ.get("SCREENER_COOKIE", "")
-GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+COOKIE = os.environ.get("SCREENER_COOKIE", "")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -98,7 +97,7 @@ def clean_number(raw):
             return float(m.group(0))
         except Exception:
             pass
-    return raw
+    return None
 
 
 def parse_li_items(html_fragment):
@@ -116,14 +115,13 @@ def parse_li_items(html_fragment):
             continue
         value = clean_number(vl.group(1))
         key = re.sub(r'[\s/\-]', '', name).lower()
-        if key:
+        if key and value is not None:
             result[key] = value
             result['_label_' + key] = name
     return result
 
 
 def parse_roe_from_insights(html):
-    """ROE 3Yr confirmed in pros/cons. Extend to 5/10Yr with broader pattern."""
     result = {}
     for years, key in [("3", "roe3yr"), ("5", "roe5yr"), ("10", "roe10yr")]:
         m = re.search(
@@ -134,116 +132,188 @@ def parse_roe_from_insights(html):
     return result
 
 
-def parse_roe_from_table(html):
+def parse_table_row(html, row_label):
     """
-    Calculate ROE averages from the annual Key Metrics table.
-    Screener embeds annual ROE% values in a table row labeled 'Return on equity'.
-    Average the last 3, 5, 10 years to compute ROE 3Yr, 5Yr, 10Yr.
+    Find a table row by its label and return all cell values as a list.
+    Works for P&L, Ratios, Shareholding tables.
     """
-    result = {}
-
-    # Find the row containing "Return on equity" in a table
-    patterns = [
-        r'Return on equity\s*%?(.*?)</tr>',
-        r'ROE\s*%?(.*?)</tr>',
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, html, re.S | re.I)
-        if not m:
-            continue
-
-        row = m.group(1)
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
-        values = []
-        for cell in cells:
-            text = re.sub(r'<[^>]+>', '', cell).replace(',', '').strip()
-            try:
-                v = float(text)
-                if 0 < v < 100:  # sanity check: ROE should be 0-100%
-                    values.append(v)
-            except Exception:
-                pass
-
-        if len(values) >= 3:
-            result['roe3yr']  = round(sum(values[:3])  / min(3,  len(values[:3])),  2)
-        if len(values) >= 5:
-            result['roe5yr']  = round(sum(values[:5])  / min(5,  len(values[:5])),  2)
-        if len(values) >= 10:
-            result['roe10yr'] = round(sum(values[:10]) / min(10, len(values[:10])), 2)
-
-        if result:
-            break
-
-    return result
-
-
-def parse_fii_dii_from_charts(html):
-    """
-    Screener embeds shareholding chart data as JSON in script tags.
-    Look for patterns like [{"name":"Promoters","y":...},{"name":"FII","y":...}]
-    """
-    result = {}
-
-    # Pattern 1: highcharts/chart data JSON
-    chart_patterns = [
-        r'\{[^{}]*["\'](?:FII|Foreign Inst)["\'][^{}]*["\']y["\'][^{}]*?([\d.]+)',
-        r'["\'](?:FII|Foreign Inst)["\'][^,]{0,50}?[\d.]+[^,]{0,10}?([\d.]+)',
-        r'FII["\'][^}]{0,100}?["\']y["\'][^}]{0,20}?([\d.]+)',
-    ]
-
-    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.S | re.I)
-    for script in scripts:
-        if 'FII' not in script and 'Promoter' not in script:
-            continue
-        # Try to find FII value in chart data
-        for p in chart_patterns:
-            m = re.search(p, script, re.I)
-            if m:
-                v = float(m.group(1))
-                if 0 < v < 100:
-                    result['fiiholding'] = v
-                    break
-
-        # Try DII
-        dii_m = re.search(
-            r'["\'](?:DII|Domestic Inst)["\'][^}]{0,100}?["\']y["\'][^}]{0,20}?([\d.]+)',
-            script, re.I)
-        if dii_m:
-            v = float(dii_m.group(1))
-            if 0 < v < 100:
-                result['diiholding'] = v
-
-        if len(result) == 2:
-            break
-
-    return result
-
-
-def parse_ttm(html, row_label):
-    pattern = re.compile(r'<tr[^>]*>.*?' + re.escape(row_label) + r'.*?</tr>', re.S | re.I)
+    escaped = re.escape(row_label)
+    pattern = re.compile(
+        r'<tr[^>]*>.*?' + escaped + r'.*?</tr>', re.S | re.I)
     m = pattern.search(html)
     if not m:
+        return []
+    row = m.group(0)
+    cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.S | re.I)
+    values = []
+    for cell in cells:
+        text = re.sub(r'<[^>]+>', '', cell).replace(',', '').replace('%', '').strip()
+        if text:
+            values.append(text)
+    return values
+
+
+def parse_table_headers(html, near_label):
+    """
+    Find the header row of a table that contains near_label nearby.
+    Returns list of header text values.
+    """
+    idx = html.find(near_label)
+    if idx == -1:
+        return []
+    # Look for thead or header tr before this point
+    chunk = html[max(0, idx-5000):idx+500]
+    # Find last <tr> with <th> elements before the label
+    header_matches = list(re.finditer(r'<tr[^>]*>(.*?)</tr>', chunk, re.S | re.I))
+    for m in reversed(header_matches):
+        row = m.group(1)
+        if '<th' in row.lower():
+            headers = re.findall(r'<th[^>]*>(.*?)</th>', row, re.S | re.I)
+            return [re.sub(r'<[^>]+>', '', h).strip() for h in headers]
+    return []
+
+
+def parse_ttm_from_pl(html, row_label):
+    """Get the rightmost (most recent/TTM) value from a P&L table row."""
+    values = parse_table_row(html, row_label)
+    # Skip the first cell (row label) and get the last numeric value
+    for v in reversed(values[1:]):
+        try:
+            return float(v.replace(',', ''))
+        except Exception:
+            pass
+    return None
+
+
+def parse_roce_by_year(html, year):
+    """
+    Parse ROCE% from the Ratios table for a specific year (e.g. 2023, 2024, 2025).
+    Matches Mar YEAR column.
+    """
+    # Find ROCE % row
+    roce_values = parse_table_row(html, "ROCE %")
+    if not roce_values:
+        roce_values = parse_table_row(html, "ROCE")
+
+    if not roce_values:
         return None
-    cells = re.findall(r'<td[^>]*>(.*?)</td>', m.group(0), re.S | re.I)
-    if not cells:
+
+    # Find header row near "ROCE" to match column positions
+    idx = html.find("ROCE %")
+    if idx == -1:
+        idx = html.find("ROCE")
+    if idx == -1:
         return None
-    last = re.sub(r'<[^>]+>', '', cells[-1]).replace(',', '').strip()
+
+    # Search backwards for the header row with Mar years
+    chunk = html[max(0, idx-8000):idx]
+    header_m = None
+    for m in re.finditer(r'<tr[^>]*>(.*?)</tr>', chunk, re.S | re.I):
+        row = m.group(1)
+        if 'Mar' in row and '<th' in row.lower():
+            header_m = m
+
+    if not header_m:
+        return None
+
+    headers = re.findall(r'<th[^>]*>(.*?)</th>', header_m.group(1), re.S | re.I)
+    headers = [re.sub(r'<[^>]+>', '', h).strip() for h in headers]
+
+    # Find column index for the target year
+    target = "Mar " + str(year)
+    col_idx = None
+    for i, h in enumerate(headers):
+        if target in h:
+            col_idx = i
+            break
+
+    if col_idx is None:
+        return None
+
+    # roce_values[0] is "ROCE %" label, so col_idx maps to roce_values[col_idx]
     try:
-        return float(last)
+        return float(roce_values[col_idx].replace('%', ''))
     except Exception:
         return None
 
 
-def parse_roce_by_year(html, year):
-    for p in [
-        re.compile(r'ROCE[^<]{0,200}?' + str(year) + r'[^<]{0,100}?([\d.]+)', re.S | re.I),
-        re.compile(str(year) + r'[^<]{0,300}?ROCE[^<]{0,100}?([\d.]+)', re.S | re.I)
-    ]:
-        m = p.search(html)
-        if m:
-            return float(m.group(1))
-    return None
+def parse_shareholding(html):
+    """
+    Parse FII and DII from the Shareholding Pattern table.
+    Gets the most recent quarter (last column).
+    """
+    result = {}
+
+    for label, key in [("FIIs", "fiiholding"), ("DIIs", "diiholding"),
+                        ("FII", "fiiholding"), ("DII", "diiholding")]:
+        if key in result:
+            continue
+        values = parse_table_row(html, label)
+        if not values:
+            continue
+        # Skip label cell, get last numeric value (most recent quarter)
+        for v in reversed(values):
+            cleaned = v.replace('%', '').replace(',', '').strip()
+            try:
+                num = float(cleaned)
+                if 0 < num < 100:
+                    result[key] = num
+                    break
+            except Exception:
+                pass
+
+    return result
+
+
+def parse_compounded_tables(html):
+    """
+    Parse the compounded growth and return-on-equity boxes at the bottom of P&L.
+    Structure:
+      <h2>Compounded Sales Growth</h2>
+      <table>
+        <tr><td>10 Years:</td><td>15%</td></tr>
+        <tr><td>5 Years:</td><td>18%</td></tr>
+        <tr><td>3 Years:</td><td>6%</td></tr>
+        <tr><td>TTM:</td><td>10%</td></tr>
+      </table>
+    """
+    result = {}
+
+    sections = {
+        "Compounded Sales Growth":   {"10 Years": "salesgrowth10y", "5 Years": "salesgrowth5y",
+                                       "3 Years": "salesgrowth3y"},
+        "Compounded Profit Growth":  {"10 Years": "profitgrowth10y", "5 Years": "profitgrowth5y",
+                                       "3 Years": "profitgrowth3y"},
+        "Stock Price CAGR":          {"10 Years": "cagr10y", "5 Years": "cagr5y",
+                                       "3 Years": "cagr3y"},
+        "Return on Equity":          {"10 Years": "roe10yr", "5 Years": "roe5yr",
+                                       "3 Years": "roe3yr"},
+    }
+
+    for section_title, metric_map in sections.items():
+        idx = html.find(section_title)
+        if idx == -1:
+            continue
+        # Get the table right after this heading (within 1000 chars)
+        chunk = html[idx:idx+1500]
+        table_m = re.search(r'<table[^>]*>(.*?)</table>', chunk, re.S | re.I)
+        if not table_m:
+            continue
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_m.group(1), re.S | re.I)
+        for row in rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
+            if len(cells) < 2:
+                continue
+            label = re.sub(r'<[^>]+>', '', cells[0]).strip()
+            value_raw = re.sub(r'<[^>]+>', '', cells[1]).replace('%', '').replace(',', '').strip()
+            for period, key in metric_map.items():
+                if period.lower() in label.lower():
+                    try:
+                        result[key] = float(value_raw)
+                    except Exception:
+                        pass
+
+    return result
 
 
 def get_all_ratios(ticker):
@@ -251,46 +321,46 @@ def get_all_ratios(ticker):
     if not html:
         return {}
 
-    # 1. Top-ratios (confirmed correct)
+    # 1. Top-ratios (9 confirmed correct default metrics)
     result = parse_li_items(extract_ul_section(html, "top-ratios"))
 
-    # 2. Quick ratios API (sales/profit growth, returns — mostly correct)
-    company_id = get_company_id(html)
-    if company_id:
-        qr_html = fetch_quick_ratios(company_id)
-        if qr_html:
-            result.update(parse_li_items(qr_html))
+    # 2. Compounded growth tables from P&L section (Sales/Profit Growth, CAGR, ROE averages)
+    compound = parse_compounded_tables(html)
+    result.update(compound)
 
-    # 3. ROE averages: try insights first (confirmed for 3Yr)
-    roe_insights = parse_roe_from_insights(html)
-    result.update(roe_insights)
+    # 3. ROE 3Yr from insights (confirmed accurate — override if better)
+    insights_roe = parse_roe_from_insights(html)
+    result.update(insights_roe)
 
-    # 4. ROE averages: fill missing ones from Key Metrics table calculation
-    roe_table = parse_roe_from_table(html)
-    for key in ['roe3yr', 'roe5yr', 'roe10yr']:
-        if key not in result or result.get(key) in [None, "N/A"]:
-            if key in roe_table:
-                result[key] = roe_table[key]
-
-    # 5. FII/DII from chart data embedded in scripts
-    fii_dii = parse_fii_dii_from_charts(html)
-    result.update(fii_dii)
+    # 4. FII/DII from Shareholding table
+    shareholding = parse_shareholding(html)
+    result.update(shareholding)
 
     return result
 
 
 METRIC_MAP = {
-    "MARKETCAP": "marketcap", "BOOKVALUE": "bookvalue",
-    "PE": "stockpe", "ROE": "roe", "ROCE": "roce",
-    "DIVIDENDYIELD": "dividendyield", "PRICE": "currentprice",
-    "SALESGROWTH3Y": "salesgrowth3years", "SALESGROWTH5Y": "salesgrowth5years",
-    "SALESGROWTH10Y": "salesvar10yrs",
-    "PROFITGROWTH3Y": "profitvar3yrs", "PROFITGROWTH5Y": "profitvar5yrs",
-    "PROFITGROWTH10Y": "profitvar10yrs",
-    "ROE3Y": "roe3yr", "ROE5Y": "roe5yr", "ROE10Y": "roe10yr",
-    "CAGR3Y": "returnover3years", "CAGR5Y": "returnover5years",
-    "CAGR10Y": "returnover10years",
-    "FII": "fiiholding", "DII": "diiholding",
+    "MARKETCAP":       "marketcap",
+    "BOOKVALUE":       "bookvalue",
+    "PE":              "stockpe",
+    "ROE":             "roe",
+    "ROCE":            "roce",
+    "DIVIDENDYIELD":   "dividendyield",
+    "PRICE":           "currentprice",
+    "SALESGROWTH3Y":   "salesgrowth3y",
+    "SALESGROWTH5Y":   "salesgrowth5y",
+    "SALESGROWTH10Y":  "salesgrowth10y",
+    "PROFITGROWTH3Y":  "profitgrowth3y",
+    "PROFITGROWTH5Y":  "profitgrowth5y",
+    "PROFITGROWTH10Y": "profitgrowth10y",
+    "ROE3Y":           "roe3yr",
+    "ROE5Y":           "roe5yr",
+    "ROE10Y":          "roe10yr",
+    "CAGR3Y":          "cagr3y",
+    "CAGR5Y":          "cagr5y",
+    "CAGR10Y":         "cagr10y",
+    "FII":             "fiiholding",
+    "DII":             "diiholding",
 }
 
 
@@ -305,13 +375,18 @@ def stock():
     if not html:
         return jsonify({"error": "Could not fetch Screener"}), 503
 
+    # TTM financials from P&L table
     if metric == "SALESTTM":
-        return jsonify({"value": parse_ttm(html, "Sales") or "N/A"})
+        v = parse_ttm_from_pl(html, "Sales")
+        return jsonify({"value": v if v is not None else "N/A"})
     if metric == "PATTTM":
-        return jsonify({"value": parse_ttm(html, "Net Profit") or "N/A"})
+        v = parse_ttm_from_pl(html, "Net Profit")
+        return jsonify({"value": v if v is not None else "N/A"})
+
+    # ROCE by FY from Ratios table
     if metric in ("ROCE2023", "ROCE2024", "ROCE2025"):
         v = parse_roce_by_year(html, metric.replace("ROCE", ""))
-        return jsonify({"value": v or "N/A"})
+        return jsonify({"value": v if v is not None else "N/A"})
 
     ratios = get_all_ratios(ticker)
 
@@ -334,61 +409,40 @@ def debug_labels():
     html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
-    ratios = get_all_ratios(ticker)
-    values = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
+
+    ratios      = get_all_ratios(ticker)
+    values      = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
+    compound    = parse_compounded_tables(html)
+    shareholding = parse_shareholding(html)
+    roce2023    = parse_roce_by_year(html, "2023")
+    roce2024    = parse_roce_by_year(html, "2024")
+    roce2025    = parse_roce_by_year(html, "2025")
+    sales_ttm   = parse_ttm_from_pl(html, "Sales")
+    pat_ttm     = parse_ttm_from_pl(html, "Net Profit")
+
     return jsonify({
-        "values": values,
-        "roe_from_insights": parse_roe_from_insights(html),
-        "roe_from_table":    parse_roe_from_table(html),
-        "fii_dii_from_charts": parse_fii_dii_from_charts(html),
+        "all_values":    values,
+        "compound_tables": compound,
+        "shareholding":  shareholding,
+        "roce_by_year":  {"2023": roce2023, "2024": roce2024, "2025": roce2025},
+        "ttm":           {"sales": sales_ttm, "pat": pat_ttm},
     })
 
 
-@app.route("/debug-roe-table")
-def debug_roe_table():
-    """Show raw ROE row from the Key Metrics table"""
+@app.route("/debug-raw-row")
+def debug_raw_row():
+    """Show raw cells from any table row by label"""
     ticker = request.args.get("ticker", "RELIANCE").upper()
+    label  = request.args.get("label", "ROCE %")
     html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
+    values = parse_table_row(html, label)
+    idx    = html.find(label)
+    context = html[max(0,idx-200):idx+500] if idx != -1 else "not found"
+    return jsonify({"label": label, "parsed_values": values, "context": context})
 
-    results = {}
-    for label in ["Return on equity", "ROE"]:
-        m = re.search(label + r'\s*%?(.*?)</tr>', html, re.S | re.I)
-        if m:
-            row = m.group(1)
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
-            texts = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
-            results[label] = texts[:12]
 
-    return jsonify(results)
-
-@app.route("/debug-roe-raw")
-def debug_roe_raw():
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    html   = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-    
-    # Find every occurrence of ROE-related text and show context
-    results = []
-    search_terms = ["Return on equity", "return-on-equity", "roe", "ROE"]
-    for term in search_terms:
-        idx = 0
-        count = 0
-        while count < 3:
-            idx = html.find(term, idx)
-            if idx == -1:
-                break
-            results.append({
-                "term": term,
-                "position": idx,
-                "context": html[max(0, idx-100):idx+400]
-            })
-            idx += len(term)
-            count += 1
-    
-    return jsonify({"results": results[:8]})
 @app.route("/clear-cache")
 def clear_cache():
     cache.clear()
