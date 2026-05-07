@@ -66,6 +66,21 @@ def fetch_quick_ratios(company_id):
     return None
 
 
+def clean_number(raw):
+    # Strip HTML tags
+    raw = re.sub(r'<[^>]+>', '', raw).strip()
+    # Remove currency and spaces but KEEP minus sign
+    raw = re.sub(r'[₹\s,]', '', raw)
+    # Extract number including optional leading minus
+    m = re.search(r'-?[\d.]+', raw)
+    if m:
+        try:
+            return float(m.group(0))
+        except Exception:
+            pass
+    return raw
+
+
 def parse_li_items(html_fragment):
     result = {}
     if not html_fragment:
@@ -81,33 +96,22 @@ def parse_li_items(html_fragment):
         if not name:
             continue
 
-        # Get value span first (class="nowrap value"), then find number inside it
-        # This prevents picking up trend/change indicators elsewhere in the item
-        val_span = re.search(r'class="[^"]*nowrap[^"]*value[^"]*"[^>]*>(.*?)</span>\s*</li>',
+        # Find the value span, then the number inside it
+        val_span = re.search(r'class="[^"]*nowrap[^"]*value[^"]*"[^>]*>(.*?)</span>\s*\n?\s*</li>',
                              item, re.S | re.I)
-        if not val_span:
-            val_span = re.search(r'class="[^"]*value[^"]*"[^>]*>(.*?)$',
-                                 item, re.S | re.I)
-
         if val_span:
-            val_content = val_span.group(1)
-            # Get number inside value span
-            vl = re.search(r'class="number"[^>]*>(.*?)</span>', val_content, re.S | re.I)
-            if not vl:
-                continue
+            vl = re.search(r'class="number"[^>]*>(.*?)</span>', val_span.group(1), re.S | re.I)
         else:
-            # Fallback: find value span then number
             vl = re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S | re.I)
-            if not vl:
-                continue
 
-        raw = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
-        raw = re.sub(r'[,\s]', '', raw)
-        nums = re.findall(r'[\d.]+', raw)
+        if not vl:
+            continue
+
+        value = clean_number(vl.group(1))
         key = re.sub(r'[\s/\-]', '', name).lower()
 
         if key:
-            result[key] = float(nums[0]) if nums else raw
+            result[key] = value
             result['_label_' + key] = name
 
     return result
@@ -266,7 +270,7 @@ def debug_qr_raw():
     qr_html = fetch_quick_ratios(company_id)
     if not qr_html:
         return jsonify({"error": "no quick ratios"})
-    return jsonify({"raw": qr_html[:3000]})
+    return jsonify({"raw": qr_html})
 
 
 @app.route("/health")
