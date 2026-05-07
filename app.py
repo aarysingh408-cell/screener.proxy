@@ -70,24 +70,46 @@ def parse_li_items(html_fragment):
     result = {}
     if not html_fragment:
         return result
+
     items = re.findall(r'<li[^>]*>(.*?)</li>', html_fragment, re.S | re.I)
     for item in items:
+        # Get name
         nm = re.search(r'class="name"[^>]*>(.*?)</span>', item, re.S | re.I)
         if not nm:
             continue
         name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
         if not name:
             continue
-        vl = re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S | re.I)
-        if not vl:
-            continue
+
+        # Get value span first (class="nowrap value"), then find number inside it
+        # This prevents picking up trend/change indicators elsewhere in the item
+        val_span = re.search(r'class="[^"]*nowrap[^"]*value[^"]*"[^>]*>(.*?)</span>\s*</li>',
+                             item, re.S | re.I)
+        if not val_span:
+            val_span = re.search(r'class="[^"]*value[^"]*"[^>]*>(.*?)$',
+                                 item, re.S | re.I)
+
+        if val_span:
+            val_content = val_span.group(1)
+            # Get number inside value span
+            vl = re.search(r'class="number"[^>]*>(.*?)</span>', val_content, re.S | re.I)
+            if not vl:
+                continue
+        else:
+            # Fallback: find value span then number
+            vl = re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S | re.I)
+            if not vl:
+                continue
+
         raw = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
         raw = re.sub(r'[,\s]', '', raw)
         nums = re.findall(r'[\d.]+', raw)
         key = re.sub(r'[\s/\-]', '', name).lower()
+
         if key:
             result[key] = float(nums[0]) if nums else raw
             result['_label_' + key] = name
+
     return result
 
 
@@ -121,17 +143,12 @@ def get_all_ratios(ticker):
     html = fetch_screener(ticker)
     if not html:
         return {}
-
-    # Parse default top-ratios from main page
     result = parse_li_items(extract_ul_section(html, "top-ratios"))
-
-    # Fetch and parse quick ratios from dedicated API endpoint
     company_id = get_company_id(html)
     if company_id:
         qr_html = fetch_quick_ratios(company_id)
         if qr_html:
             result.update(parse_li_items(qr_html))
-
     return result
 
 
@@ -235,6 +252,21 @@ def debug_labels():
     labels = {k.replace('_label_', ''): v for k, v in ratios.items() if k.startswith('_label_')}
     values = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
     return jsonify({"total_found": len(labels), "labels": labels, "values": values})
+
+
+@app.route("/debug-qr-raw")
+def debug_qr_raw():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    company_id = get_company_id(html)
+    if not company_id:
+        return jsonify({"error": "no company id"})
+    qr_html = fetch_quick_ratios(company_id)
+    if not qr_html:
+        return jsonify({"error": "no quick ratios"})
+    return jsonify({"raw": qr_html[:3000]})
 
 
 @app.route("/health")
