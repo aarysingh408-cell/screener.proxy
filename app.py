@@ -64,28 +64,6 @@ def fetch_quick_ratios(company_id):
     return None
 
 
-def fetch_shareholding(company_id):
-    key = "sh_" + str(company_id)
-    if key in cache:
-        return cache[key]
-    # Try multiple Screener shareholding endpoints
-    endpoints = [
-        "/api/company/" + company_id + "/shareholding/",
-        "/api/company/" + company_id + "/shareholding/?period=quarterly",
-        "/api/company/" + company_id + "/shareholding/?period=annual",
-    ]
-    for ep in endpoints:
-        try:
-            r = requests.get("https://www.screener.in" + ep,
-                             headers=API_HEADERS, timeout=15)
-            if r.status_code == 200 and len(r.text) > 100:
-                cache[key] = r.text
-                return r.text, ep
-        except Exception:
-            pass
-    return None, None
-
-
 def extract_ul_section(html, section_id):
     start = html.find('id="' + section_id + '"')
     if start == -1:
@@ -144,55 +122,44 @@ def parse_li_items(html_fragment):
     return result
 
 
-def parse_insights_roe(html):
+def parse_insights(html):
     """
-    Extract ROE averages from Screener's key insights text.
-    Example: 'return on equity of 8.91% over last 3 years'
-    Confirmed present in page HTML from earlier debug.
+    Extract metrics from Screener's key insights sentences.
+    ROE 3Yr confirmed working. Searching for 5Yr/10Yr and FII/DII patterns.
     """
     result = {}
-    patterns = [
-        (r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*3\s*years?', 'roe3yr'),
-        (r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*5\s*years?', 'roe5yr'),
-        (r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*10\s*years?', 'roe10yr'),
-    ]
-    for pattern, key in patterns:
-        m = re.search(pattern, html, re.I)
+
+    # ROE averages
+    for years, key in [("3", "roe3yr"), ("5", "roe5yr"), ("10", "roe10yr")]:
+        m = re.search(
+            r'return on equity of ([\d.]+)%\s*over\s*(?:the\s*)?last\s*' + years + r'\s*years?',
+            html, re.I)
         if m:
             result[key] = float(m.group(1))
-    return result
 
-
-def parse_fii_dii_from_html(html):
-    """
-    Try to extract FII/DII from shareholding section in HTML.
-    Screener embeds some shareholding data in the page for charts.
-    """
-    result = {}
-
-    # Try JSON data embedded in script tags
-    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.S | re.I)
-    for script in scripts:
-        # Look for FII percentage in JSON
-        fii_m = re.search(r'["\'](?:FII|Foreign Institutional)["\'].*?:\s*["\']?([\d.]+)', script, re.I)
-        dii_m = re.search(r'["\'](?:DII|Domestic Institutional)["\'].*?:\s*["\']?([\d.]+)', script, re.I)
-        if fii_m:
-            result['fiiholding'] = float(fii_m.group(1))
-        if dii_m:
-            result['diiholding'] = float(dii_m.group(1))
-        if result:
+    # FII — Screener sometimes embeds FII in meta/insights as "FII holding of X%"
+    fii_patterns = [
+        r'FII\s*holding[^<]{0,30}?([\d.]+)\s*%',
+        r'Foreign\s*Institutional[^<]{0,50}?([\d.]+)\s*%',
+        r'FII[^<]{0,20}?:\s*([\d.]+)',
+    ]
+    for p in fii_patterns:
+        m = re.search(p, html, re.I)
+        if m:
+            result['fiiholding'] = float(m.group(1))
             break
 
-    # Try shareholding table in HTML
-    if 'fiiholding' not in result:
-        fii_m = re.search(r'FII[^<]{0,50}?</td>\s*<td[^>]*>\s*([\d.]+)', html, re.I)
-        if fii_m:
-            result['fiiholding'] = float(fii_m.group(1))
-
-    if 'diiholding' not in result:
-        dii_m = re.search(r'DII[^<]{0,50}?</td>\s*<td[^>]*>\s*([\d.]+)', html, re.I)
-        if dii_m:
-            result['diiholding'] = float(dii_m.group(1))
+    # DII
+    dii_patterns = [
+        r'DII\s*holding[^<]{0,30}?([\d.]+)\s*%',
+        r'Domestic\s*Institutional[^<]{0,50}?([\d.]+)\s*%',
+        r'DII[^<]{0,20}?:\s*([\d.]+)',
+    ]
+    for p in dii_patterns:
+        m = re.search(p, html, re.I)
+        if m:
+            result['diiholding'] = float(m.group(1))
+            break
 
     return result
 
@@ -228,24 +195,18 @@ def get_all_ratios(ticker):
     if not html:
         return {}
 
-    # Start with top-ratios (9 confirmed correct metrics)
+    # 1. Default top-ratios (9 confirmed correct)
     result = parse_li_items(extract_ul_section(html, "top-ratios"))
 
-    # Add quick_ratios from API (sales growth, profit growth, returns)
+    # 2. Quick ratios API (sales/profit growth, returns)
     company_id = get_company_id(html)
     if company_id:
         qr_html = fetch_quick_ratios(company_id)
         if qr_html:
             result.update(parse_li_items(qr_html))
 
-    # Override ROE 3/5/10Yr with values from insights text
-    # (confirmed more accurate than quick_ratios API)
-    insights_roe = parse_insights_roe(html)
-    result.update(insights_roe)
-
-    # Try FII/DII from HTML
-    fii_dii = parse_fii_dii_from_html(html)
-    result.update(fii_dii)
+    # 3. Override with insights-parsed values (more accurate for ROE + FII/DII)
+    result.update(parse_insights(html))
 
     return result
 
@@ -296,7 +257,6 @@ def stock():
     lookup = METRIC_MAP.get(metric)
     if not lookup:
         return jsonify({"error": "Unknown metric: " + metric}), 400
-
     return jsonify({"value": ratios.get(lookup, "N/A")})
 
 
@@ -306,48 +266,39 @@ def debug_labels():
     html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
-
-    ratios = get_all_ratios(ticker)
-    values = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
-
-    # Also test shareholding API endpoints
-    company_id = get_company_id(html)
-    sh_data, sh_ep = fetch_shareholding(company_id) if company_id else (None, None)
-
+    ratios  = get_all_ratios(ticker)
+    values  = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
+    insights = parse_insights(html)
     return jsonify({
         "values": values,
-        "roe_from_insights": parse_insights_roe(html),
-        "fii_dii_from_html": parse_fii_dii_from_html(html),
-        "shareholding_endpoint": sh_ep,
-        "shareholding_preview": sh_data[:500] if sh_data else None
+        "insights_parsed": insights
     })
 
 
-@app.route("/debug-shareholding")
-def debug_shareholding():
-    ticker     = request.args.get("ticker", "RELIANCE").upper()
-    html       = fetch_screener(ticker)
+@app.route("/debug-insights-raw")
+def debug_insights_raw():
+    """Shows all insight sentences from the page so we can find exact patterns"""
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
-    company_id = get_company_id(html)
-    if not company_id:
-        return jsonify({"error": "no company id"})
 
-    results = {}
-    endpoints = [
-        "/api/company/" + company_id + "/shareholding/",
-        "/api/company/" + company_id + "/shareholding/?period=quarterly",
-        "/api/company/" + company_id + "/shareholding/?period=annual",
-        "/company/" + ticker + "/shareholding/",
-    ]
-    for ep in endpoints:
-        try:
-            r = requests.get("https://www.screener.in" + ep,
-                             headers=API_HEADERS, timeout=10)
-            results[ep] = {"status": r.status_code, "preview": r.text[:300]}
-        except Exception as e:
-            results[ep] = {"error": str(e)}
-    return jsonify(results)
+    # Extract all insight list items
+    insights_section = extract_ul_section(html, "key-insights")
+    if not insights_section:
+        # Try finding any insights/pros/cons section
+        idx = html.find("key-insights")
+        if idx == -1:
+            idx = html.find("pros")
+        context = html[max(0, idx-100):idx+3000] if idx != -1 else ""
+        return jsonify({
+            "key_insights_section": "not found with id",
+            "context": context[:2000]
+        })
+
+    items = re.findall(r'<li[^>]*>(.*?)</li>', insights_section, re.S | re.I)
+    texts = [re.sub(r'<[^>]+>', '', item).strip() for item in items]
+    return jsonify({"insight_sentences": texts})
 
 
 @app.route("/clear-cache")
@@ -358,7 +309,7 @@ def clear_cache():
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "cookie_set": bool(COOKIE), "groq_key_set": bool(GROQ_KEY)})
+    return jsonify({"status": "ok", "cookie_set": bool(COOKIE)})
 
 
 if __name__ == "__main__":
