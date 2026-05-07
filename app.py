@@ -51,6 +51,46 @@ def get_company_id(html):
     return None
 
 
+def fetch_quick_ratios(company_id):
+    cache_key = "qr_" + str(company_id)
+    if cache_key in cache:
+        return cache[cache_key]
+    url = "https://www.screener.in/api/company/" + str(company_id) + "/quick_ratios/"
+    try:
+        r = requests.get(url, headers=API_HEADERS, timeout=15)
+        if r.status_code == 200:
+            cache[cache_key] = r.text
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def parse_li_items(html_fragment):
+    result = {}
+    if not html_fragment:
+        return result
+    items = re.findall(r'<li[^>]*>(.*?)</li>', html_fragment, re.S | re.I)
+    for item in items:
+        nm = re.search(r'class="name"[^>]*>(.*?)</span>', item, re.S | re.I)
+        if not nm:
+            continue
+        name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
+        if not name:
+            continue
+        vl = re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S | re.I)
+        if not vl:
+            continue
+        raw = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
+        raw = re.sub(r'[,\s]', '', raw)
+        nums = re.findall(r'[\d.]+', raw)
+        key = re.sub(r'[\s/\-]', '', name).lower()
+        if key:
+            result[key] = float(nums[0]) if nums else raw
+            result['_label_' + key] = name
+    return result
+
+
 def extract_ul_section(html, section_id):
     marker = 'id="' + section_id + '"'
     start = html.find(marker)
@@ -77,28 +117,21 @@ def extract_ul_section(html, section_id):
     return ""
 
 
-def parse_ul_section(section):
-    result = {}
-    if not section:
-        return result
-    items = re.findall(r'<li[^>]*>(.*?)</li>', section, re.S | re.I)
-    for item in items:
-        nm = re.search(r'class="name"[^>]*>(.*?)</span>', item, re.S | re.I)
-        if not nm:
-            continue
-        name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
-        if not name:
-            continue
-        vl = re.search(r'class="number"[^>]*>(.*?)</span>', item, re.S | re.I)
-        if not vl:
-            continue
-        raw = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
-        raw = re.sub(r'[,\s]', '', raw)
-        nums = re.findall(r'[\d.]+', raw)
-        key = re.sub(r'[\s/\-]', '', name).lower()
-        if key:
-            result[key] = float(nums[0]) if nums else raw
-            result['_label_' + key] = name
+def get_all_ratios(ticker):
+    html = fetch_screener(ticker)
+    if not html:
+        return {}
+
+    # Parse default top-ratios from main page
+    result = parse_li_items(extract_ul_section(html, "top-ratios"))
+
+    # Fetch and parse quick ratios from dedicated API endpoint
+    company_id = get_company_id(html)
+    if company_id:
+        qr_html = fetch_quick_ratios(company_id)
+        if qr_html:
+            result.update(parse_li_items(qr_html))
+
     return result
 
 
@@ -158,29 +191,37 @@ def stock():
     metric = request.args.get("metric", "").upper().replace(" ", "").replace("_", "")
     if not ticker or not metric:
         return jsonify({"error": "ticker and metric required"}), 400
+
     html = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "Could not fetch Screener - check cookie"}), 503
-    ratios = parse_ul_section(extract_ul_section(html, "top-ratios"))
+
+    ratios = get_all_ratios(ticker)
+
     if metric == "PB":
         price = ratios.get("currentprice")
         bv = ratios.get("bookvalue")
         if price and bv and float(bv) != 0:
             return jsonify({"value": round(float(price) / float(bv), 2)})
         return jsonify({"value": "N/A"})
+
     if metric == "SALESTTM":
         v = parse_ttm(html, "Sales")
         return jsonify({"value": v if v is not None else "N/A"})
+
     if metric == "PATTTM":
         v = parse_ttm(html, "Net Profit")
         return jsonify({"value": v if v is not None else "N/A"})
+
     if metric in ("ROCE2023", "ROCE2024", "ROCE2025"):
         year = metric.replace("ROCE", "")
         v = parse_roce_by_year(html, year)
         return jsonify({"value": v if v is not None else "N/A"})
+
     lookup = METRIC_MAP.get(metric)
     if not lookup:
         return jsonify({"error": "Unknown metric: " + metric}), 400
+
     value = ratios.get(lookup, "N/A")
     return jsonify({"value": value})
 
@@ -188,77 +229,12 @@ def stock():
 @app.route("/debug-labels")
 def debug_labels():
     ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-    ratios = parse_ul_section(extract_ul_section(html, "top-ratios"))
+    ratios = get_all_ratios(ticker)
+    if not ratios:
+        return jsonify({"error": "no data"})
     labels = {k.replace('_label_', ''): v for k, v in ratios.items() if k.startswith('_label_')}
     values = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
     return jsonify({"total_found": len(labels), "labels": labels, "values": values})
-
-
-@app.route("/debug-api-try")
-def debug_api_try():
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-    company_id = get_company_id(html)
-    if not company_id:
-        return jsonify({"error": "no company id"})
-
-    results = {}
-    # Try every plausible endpoint pattern
-    endpoints = [
-        "/api/company/" + company_id + "/quick_ratios/",
-        "/api/company/" + company_id + "/quick-ratios/",
-        "/api/company/" + company_id + "/ratios/",
-        "/api/company/" + company_id + "/",
-        "/company/" + ticker + "/quick_ratios/",
-        "/company/" + company_id + "/quick_ratios/",
-    ]
-    for ep in endpoints:
-        try:
-            r = requests.get("https://www.screener.in" + ep,
-                             headers=API_HEADERS, timeout=10)
-            results[ep] = {
-                "status": r.status_code,
-                "preview": r.text[:200]
-            }
-        except Exception as e:
-            results[ep] = {"error": str(e)}
-
-    return jsonify(results)
-
-
-@app.route("/debug-find-values")
-def debug_find_values():
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-
-    # Search for known values from the screenshot to find where data lives
-    search_values = ["6.45", "18.7", "8.91", "20.5", "8.73", "9.26", "12.8", "6.53"]
-    found = {}
-    for val in search_values:
-        idx = html.find(val)
-        if idx != -1:
-            found[val] = html[max(0, idx - 150):idx + 150]
-        else:
-            found[val] = "NOT FOUND"
-
-    # Also check all script tags for JSON data
-    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.S | re.I)
-    json_scripts = []
-    for s in scripts:
-        if any(v in s for v in search_values):
-            json_scripts.append(s[:500])
-
-    return jsonify({
-        "value_search": found,
-        "scripts_with_data": json_scripts[:3]
-    })
 
 
 @app.route("/health")
