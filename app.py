@@ -30,48 +30,80 @@ def fetch_screener(ticker):
             if "top-ratios" in r.text:
                 cache[ticker] = r.text
                 return r.text
-        except Exception as e:
+        except Exception:
             pass
     return None
 
 
-def parse_top_ratios(html):
-    result = {}
+def extract_section(html):
+    # Use string slicing instead of regex to avoid nested tag issues
+    marker = 'id="top-ratios"'
+    start = html.find(marker)
+    if start == -1:
+        marker = "id='top-ratios'"
+        start = html.find(marker)
+    if start == -1:
+        return ""
 
-    sec = None
-    for p in [r'id=["\']top-ratios["\'][^>]*>(.*?)', r'top-ratios[^>]*>(.*?)']:
-        m = re.search(p, html, re.S | re.I)
-        if m:
-            sec = m.group(1)
+    # Find the > that closes the opening 
+ tag
+    open_end = html.find('>', start)
+    if open_end == -1:
+        return ""
+
+    # Walk forward counting 
+ opens and closes to find matching 
+
+    pos = open_end + 1
+    depth = 1
+    while pos < len(html) and depth > 0:
+        next_open  = html.find('', pos)
+        if next_close == -1:
             break
+        if next_open != -1 and next_open < next_close:
+            depth += 1
+            pos = next_open + 3
+        else:
+            depth -= 1
+            if depth == 0:
+                return html[open_end + 1:next_close]
+            pos = next_close + 5
+    return ""
 
-    if not sec:
+
+def parse_top_ratios(html):
+    result  = {}
+    section = extract_section(html)
+    if not section:
         return result
 
-    items = re.findall(r']*>(.*?)', sec, re.S | re.I)
+    # Each metric is one 
+ block
+    items = re.findall(r']*>(.*?)
+', section, re.S | re.I)
 
     for item in items:
-        spans = re.findall(r']*>(.*?)', item, re.S | re.I)
-        texts = []
-        for s in spans:
-            t = re.sub(r'<[^>]+>', '', s).strip()
-            if t:
-                texts.append(t)
+        # Name is in 
+        nm = re.search(r'class="name"[^>]*>(.*?)', item, re.S | re.I)
+        if not nm:
+            continue
+        name = re.sub(r'<[^>]+>', '', nm.group(1)).strip()
+        if not name:
+            continue
 
-        if len(texts) < 2:
-            pass
-        else:
-            name = texts[0]
-            val = texts[-1]
-            raw = re.sub(r'[₹%,\s]', '', val)
-            nums = re.findall(r'[\d.]+', raw)
-            key = re.sub(r'[\s/\-]', '', name).lower()
-            if key:
-                if nums:
-                    result[key] = float(nums[0])
-                else:
-                    result[key] = raw
-                result['_label_' + key] = name
+        # Value is in the NESTED  (not the outer value span)
+        vl = re.search(r'class="number"[^>]*>(.*?)', item, re.S | re.I)
+        if not vl:
+            continue
+
+        raw  = re.sub(r'<[^>]+>', '', vl.group(1)).strip()
+        raw  = re.sub(r'[₹%,\s]', '', raw)
+        nums = re.findall(r'[\d.]+', raw)
+        key  = re.sub(r'[\s/\-]', '', name).lower()
+
+        if key:
+            result[key]              = float(nums[0]) if nums else raw
+            result['_label_' + key] = name
 
     return result
 
@@ -102,27 +134,27 @@ def parse_roce_by_year(html, year):
 
 
 METRIC_MAP = {
-    "MARKETCAP": "marketcap",
-    "BOOKVALUE": "bookvalue",
-    "PE": "stockpe",
-    "ROE": "roe",
-    "ROCE": "roce",
-    "DIVIDENDYIELD": "dividendyield",
-    "PRICE": "currentprice",
-    "SALESGROWTH3Y": "salesgrowth3years",
-    "SALESGROWTH5Y": "salesgrowth5years",
-    "SALESGROWTH10Y": "salesvar10yrs",
-    "PROFITGROWTH3Y": "profitvar3yrs",
-    "PROFITGROWTH5Y": "profitvar5yrs",
+    "MARKETCAP":       "marketcap",
+    "BOOKVALUE":       "bookvalue",
+    "PE":              "stockpe",
+    "ROE":             "roe",
+    "ROCE":            "roce",
+    "DIVIDENDYIELD":   "dividendyield",
+    "PRICE":           "currentprice",
+    "SALESGROWTH3Y":   "salesgrowth3years",
+    "SALESGROWTH5Y":   "salesgrowth5years",
+    "SALESGROWTH10Y":  "salesvar10yrs",
+    "PROFITGROWTH3Y":  "profitvar3yrs",
+    "PROFITGROWTH5Y":  "profitvar5yrs",
     "PROFITGROWTH10Y": "profitvar10yrs",
-    "ROE3Y": "roe3yr",
-    "ROE5Y": "roe5yr",
-    "ROE10Y": "roe10yr",
-    "CAGR3Y": "3years",
-    "CAGR5Y": "5years",
-    "CAGR10Y": "10years",
-    "FII": "fiiholding",
-    "DII": "diiholding",
+    "ROE3Y":           "roe3yr",
+    "ROE5Y":           "roe5yr",
+    "ROE10Y":          "roe10yr",
+    "CAGR3Y":          "3years",
+    "CAGR5Y":          "5years",
+    "CAGR10Y":         "10years",
+    "FII":             "fiiholding",
+    "DII":             "diiholding",
 }
 
 
@@ -142,7 +174,7 @@ def stock():
 
     if metric == "PB":
         price = ratios.get("currentprice")
-        bv = ratios.get("bookvalue")
+        bv    = ratios.get("bookvalue")
         if price and bv and float(bv) != 0:
             return jsonify({"value": round(float(price) / float(bv), 2)})
         return jsonify({"value": "N/A"})
@@ -157,7 +189,7 @@ def stock():
 
     if metric in ("ROCE2023", "ROCE2024", "ROCE2025"):
         year = metric.replace("ROCE", "")
-        v = parse_roce_by_year(html, year)
+        v    = parse_roce_by_year(html, year)
         return jsonify({"value": v if v is not None else "N/A"})
 
     lookup = METRIC_MAP.get(metric)
@@ -168,66 +200,40 @@ def stock():
     return jsonify({"value": value})
 
 
-@app.route("/debug-section")
-def debug_section():
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-    m = re.search(r'id=["\']top-ratios["\'][^>]*>(.*?)', html, re.S | re.I)
-    if not m:
-        idx = html.find("top-ratios")
-        return jsonify({
-            "found": False,
-            "context": html[max(0, idx - 100):idx + 500] if idx != -1 else "NOT FOUND"
-        })
-    section = m.group(1)
-    return jsonify({
-        "found": True,
-        "section_length": len(section),
-        "section_html": section[:2000]
-    })
-
-
 @app.route("/debug-labels")
 def debug_labels():
     ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
+    html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
-    ratios = parse_top_ratios(html)
-    labels = {}
-    for k, v in ratios.items():
-        if k.startswith('_label_'):
-            labels[k.replace('_label_', '')] = v
-    return jsonify({"total_found": len(labels), "labels": labels})
+    ratios  = parse_top_ratios(html)
+    labels  = {k.replace('_label_', ''): v for k, v in ratios.items() if k.startswith('_label_')}
+    values  = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
+    return jsonify({"total_found": len(labels), "labels": labels, "values": values})
 
-
-@app.route("/debug-raw")
-def debug_raw():
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "fetch returned nothing"})
-    return jsonify({
-        "length": len(html),
-        "has_top_ratios": "top-ratios" in html,
-        "has_login": "login" in html.lower(),
-        "first_500": html[:500]
-    })
 
 @app.route("/debug-slice")
 def debug_slice():
     ticker = request.args.get("ticker", "RELIANCE").upper()
-    html = fetch_screener(ticker)
+    html   = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
     idx = html.find("top-ratios")
     if idx == -1:
         return jsonify({"error": "top-ratios not found"})
-    return jsonify({
-        "slice": html[idx:idx+3000]
-    })
+    return jsonify({"slice": html[idx:idx + 3000]})
+
+
+@app.route("/debug-section")
+def debug_section():
+    ticker  = request.args.get("ticker", "RELIANCE").upper()
+    html    = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "no html"})
+    section = extract_section(html)
+    return jsonify({"found": bool(section), "section_length": len(section), "section_html": section[:2000]})
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "cookie_set": bool(COOKIE)})
