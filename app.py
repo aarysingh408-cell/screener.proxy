@@ -146,7 +146,18 @@ def stock():
     ratios = parse_top_ratios(html)
     value  = ratios.get(lookup, "N/A")
     return jsonify({"value": value})
-
+@app.route("/debug-raw")
+def debug_raw():
+    ticker = request.args.get("ticker", "RELIANCE").upper()
+    html = fetch_screener(ticker)
+    if not html:
+        return jsonify({"error": "fetch returned nothing"})
+    return jsonify({
+        "length"        : len(html),
+        "has_top_ratios": "top-ratios" in html,
+        "has_login"     : "login" in html.lower() or "sign in" in html.lower(),
+        "first_500"     : html[:500]
+    })
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
