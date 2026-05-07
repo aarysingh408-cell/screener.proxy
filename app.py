@@ -91,22 +91,16 @@ def parse_ul_section(section):
 
 def parse_all_ratios(html):
     result = {}
-    # Parse default top-ratios section
-    section1 = extract_ul_section(html, "top-ratios")
-    result.update(parse_ul_section(section1))
-    # Find ALL other ul sections in the page that contain ratio data
-    # Screener puts quick/custom ratios in separate ul blocks
+    result.update(parse_ul_section(extract_ul_section(html, "top-ratios")))
     all_ul_ids = re.findall(r'<ul[^>]*id=["\']([^"\']+)["\']', html, re.I)
     for uid in all_ul_ids:
-        if uid == "top-ratios":
-            continue
-        if any(x in uid.lower() for x in ["ratio", "quick", "user", "metric", "data"]):
+        if uid != "top-ratios":
             section = extract_ul_section(html, uid)
-            result.update(parse_ul_section(section))
-    # Also try to find ratio li items outside of known sections
-    # by scanning for li items with class="flex flex-space-between"
+            parsed = parse_ul_section(section)
+            if parsed:
+                result.update(parsed)
     extra_items = re.findall(
-        r'<li[^>]*class="[^"]*flex[^"]*space[^"]*between[^"]*"[^>]*>(.*?)</li>',
+        r'<li[^>]*class="[^"]*flex[^"]*"[^>]*>(.*?)</li>',
         html, re.S | re.I
     )
     for item in extra_items:
@@ -154,7 +148,6 @@ def parse_roce_by_year(html, year):
     return None
 
 
-# Based on exact labels visible in screenshot
 METRIC_MAP = {
     "MARKETCAP":       "marketcap",
     "BOOKVALUE":       "bookvalue",
@@ -163,23 +156,18 @@ METRIC_MAP = {
     "ROCE":            "roce",
     "DIVIDENDYIELD":   "dividendyield",
     "PRICE":           "currentprice",
-    # Sales growth — exact labels from screenshot
     "SALESGROWTH3Y":   "salesgrowth3years",
     "SALESGROWTH5Y":   "salesgrowth5years",
     "SALESGROWTH10Y":  "salesvar10yrs",
-    # Profit growth — exact labels from screenshot
     "PROFITGROWTH3Y":  "profitvar3yrs",
     "PROFITGROWTH5Y":  "profitvar5yrs",
     "PROFITGROWTH10Y": "profitvar10yrs",
-    # ROE averages — exact labels from screenshot
     "ROE3Y":           "roe3yr",
     "ROE5Y":           "roe5yr",
     "ROE10Y":          "roe10yr",
-    # Stock returns / CAGR — exact labels from screenshot
     "CAGR3Y":          "returnover3years",
     "CAGR5Y":          "returnover5years",
     "CAGR10Y":         "returnover10years",
-    # Ownership — exact labels from screenshot
     "FII":             "fiiholding",
     "DII":             "diiholding",
 }
@@ -240,16 +228,21 @@ def debug_ul_ids():
     return jsonify({"ul_ids": ids})
 
 
-@app.route("/debug-slice")
-def debug_slice():
+@app.route("/debug-search")
+def debug_search():
     ticker = request.args.get("ticker", "RELIANCE").upper()
+    term = request.args.get("term", "FII holding")
     html = fetch_screener(ticker)
     if not html:
         return jsonify({"error": "no html"})
-    idx = html.find("top-ratios")
+    idx = html.find(term)
     if idx == -1:
-        return jsonify({"error": "top-ratios not found"})
-    return jsonify({"slice": html[idx:idx + 3000]})
+        return jsonify({"found": False, "term": term})
+    return jsonify({
+        "found": True,
+        "term": term,
+        "context": html[max(0, idx - 200):idx + 500]
+    })
 
 
 @app.route("/health")
