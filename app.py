@@ -1,6 +1,5 @@
 import os
 import re
-import json
 from flask import Flask, request, jsonify
 import requests
 from cachetools import TTLCache
@@ -132,186 +131,180 @@ def parse_roe_from_insights(html):
     return result
 
 
-def parse_table_row(html, row_label):
+def parse_ranges_tables(html):
     """
-    Find a table row by its label and return all cell values as a list.
-    Works for P&L, Ratios, Shareholding tables.
+    Parse all class='ranges-table' elements — these are the compounded growth boxes.
+    Structure confirmed from HTML:
+      <table class="ranges-table">
+        <tr><th colspan="2">Compounded Sales Growth</th></tr>
+        <tr><td>10 Years:</td><td>15%</td></tr>
+        ...
+      </table>
     """
+    result = {}
+
+    section_map = {
+        'compounded sales growth':  {'10 years': 'salesgrowth10y', '5 years': 'salesgrowth5y',  '3 years': 'salesgrowth3y'},
+        'compounded profit growth': {'10 years': 'profitgrowth10y', '5 years': 'profitgrowth5y', '3 years': 'profitgrowth3y'},
+        'stock price cagr':         {'10 years': 'cagr10y',         '5 years': 'cagr5y',         '3 years': 'cagr3y'},
+        'return on equity':         {'10 years': 'roe10yr',         '5 years': 'roe5yr',         '3 years': 'roe3yr'},
+    }
+
+    tables = re.findall(
+        r'<table[^>]*class="[^"]*ranges-table[^"]*"[^>]*>(.*?)</table>',
+        html, re.S | re.I)
+
+    for table in tables:
+        th = re.search(r'<th[^>]*>(.*?)</th>', table, re.S | re.I)
+        if not th:
+            continue
+        heading = re.sub(r'<[^>]+>', '', th.group(1)).strip().lower()
+
+        section = None
+        for key in section_map:
+            if key in heading:
+                section = section_map[key]
+                break
+        if not section:
+            continue
+
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table, re.S | re.I)
+        for row in rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
+            if len(cells) < 2:
+                continue
+            label = re.sub(r'<[^>]+>', '', cells[0]).strip().lower()
+            val   = re.sub(r'<[^>]+>', '', cells[1]).replace('%', '').replace(',', '').strip()
+            for period, metric_key in section.items():
+                if period in label:
+                    try:
+                        result[metric_key] = float(val)
+                    except Exception:
+                        pass
+
+    return result
+
+
+def parse_annual_ttm(html, row_label):
+    """
+    Get the most recent annual value from the P&L table.
+    Targets the annual section by anchoring to 'Mar 2015' (first annual column).
+    The quarterly section has 'Jun XXXX' patterns — annual only has 'Mar XXXX'.
+    """
+    # Find where annual P&L starts — it has 'Mar 2015' as first column
+    anchor = "Mar 2015"
+    anchor_idx = html.find(anchor)
+    if anchor_idx == -1:
+        return None
+
+    # Search for row_label in the annual section (start from near the anchor)
+    section = html[max(0, anchor_idx - 3000):anchor_idx + 80000]
+
     escaped = re.escape(row_label)
-    pattern = re.compile(
-        r'<tr[^>]*>.*?' + escaped + r'.*?</tr>', re.S | re.I)
-    m = pattern.search(html)
-    if not m:
-        return []
-    row = m.group(0)
-    cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.S | re.I)
-    values = []
-    for cell in cells:
-        text = re.sub(r'<[^>]+>', '', cell).replace(',', '').replace('%', '').strip()
-        if text:
-            values.append(text)
-    return values
-
-
-def parse_table_headers(html, near_label):
-    """
-    Find the header row of a table that contains near_label nearby.
-    Returns list of header text values.
-    """
-    idx = html.find(near_label)
-    if idx == -1:
-        return []
-    # Look for thead or header tr before this point
-    chunk = html[max(0, idx-5000):idx+500]
-    # Find last <tr> with <th> elements before the label
-    header_matches = list(re.finditer(r'<tr[^>]*>(.*?)</tr>', chunk, re.S | re.I))
-    for m in reversed(header_matches):
+    # Match row — use non-greedy but limit to 5000 chars to avoid cross-section match
+    for m in re.finditer(r'<tr[^>]*>((?:(?!</tr>).){0,5000}?)</tr>', section, re.S | re.I):
         row = m.group(1)
-        if '<th' in row.lower():
-            headers = re.findall(r'<th[^>]*>(.*?)</th>', row, re.S | re.I)
-            return [re.sub(r'<[^>]+>', '', h).strip() for h in headers]
-    return []
+        if row_label not in row:
+            continue
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
+        values = []
+        for cell in cells:
+            text = re.sub(r'<[^>]+>', '', cell).replace(',', '').strip()
+            try:
+                v = float(text)
+                if v > 0:
+                    values.append(v)
+            except Exception:
+                pass
+        if values:
+            return values[-1]  # most recent = last column
 
-
-def parse_ttm_from_pl(html, row_label):
-    """Get the rightmost (most recent/TTM) value from a P&L table row."""
-    values = parse_table_row(html, row_label)
-    # Skip the first cell (row label) and get the last numeric value
-    for v in reversed(values[1:]):
-        try:
-            return float(v.replace(',', ''))
-        except Exception:
-            pass
     return None
 
 
 def parse_roce_by_year(html, year):
     """
-    Parse ROCE% from the Ratios table for a specific year (e.g. 2023, 2024, 2025).
-    Matches Mar YEAR column.
+    Extract ROCE % for a specific financial year from the Ratios table.
+    The Ratios table has quarterly columns — we want 'Mar YEAR'.
     """
-    # Find ROCE % row
-    roce_values = parse_table_row(html, "ROCE %")
-    if not roce_values:
-        roce_values = parse_table_row(html, "ROCE")
-
-    if not roce_values:
+    ratios_idx = html.find('id="ratios"')
+    if ratios_idx == -1:
         return None
 
-    # Find header row near "ROCE" to match column positions
-    idx = html.find("ROCE %")
-    if idx == -1:
-        idx = html.find("ROCE")
-    if idx == -1:
-        return None
+    ratios_html = html[ratios_idx:ratios_idx + 80000]
 
-    # Search backwards for the header row with Mar years
-    chunk = html[max(0, idx-8000):idx]
-    header_m = None
-    for m in re.finditer(r'<tr[^>]*>(.*?)</tr>', chunk, re.S | re.I):
-        row = m.group(1)
-        if 'Mar' in row and '<th' in row.lower():
-            header_m = m
-
+    # Find header row containing Mar dates (th elements)
+    header_m = re.search(r'<tr[^>]*>(.*?)</tr>', ratios_html, re.S | re.I)
     if not header_m:
         return None
 
-    headers = re.findall(r'<th[^>]*>(.*?)</th>', header_m.group(1), re.S | re.I)
-    headers = [re.sub(r'<[^>]+>', '', h).strip() for h in headers]
+    # Get all th elements from header
+    headers_raw = re.findall(r'<th[^>]*>(.*?)</th>', header_m.group(1), re.S | re.I)
+    headers = [re.sub(r'<[^>]+>', '', h).strip() for h in headers_raw]
 
-    # Find column index for the target year
     target = "Mar " + str(year)
-    col_idx = None
-    for i, h in enumerate(headers):
-        if target in h:
-            col_idx = i
-            break
+    if target not in headers:
+        return None
+    col_idx = headers.index(target)  # 0-based position in headers
 
-    if col_idx is None:
+    # Find ROCE % row — has class="strong" based on HTML context
+    roce_m = re.search(
+        r'class="[^"]*strong[^"]*"[^>]*>.*?ROCE\s*%.*?</tr>',
+        ratios_html, re.S | re.I)
+    if not roce_m:
+        # Fallback: just find ROCE % row
+        roce_m = re.search(r'ROCE\s*%.*?</tr>', ratios_html, re.S | re.I)
+    if not roce_m:
         return None
 
-    # roce_values[0] is "ROCE %" label, so col_idx maps to roce_values[col_idx]
-    try:
-        return float(roce_values[col_idx].replace('%', ''))
-    except Exception:
-        return None
+    cells = re.findall(r'<td[^>]*>(.*?)</td>', roce_m.group(0), re.S | re.I)
+    # cells[0] = "ROCE %" label, cells[1..] = values matching header positions
+    # col_idx in headers is 0-based including the label column? Need to check.
+    # headers likely starts with an empty th for the label column
+    # So col_idx=1 means first data column
+    if col_idx < len(cells):
+        raw = re.sub(r'<[^>]+>', '', cells[col_idx]).replace('%', '').strip()
+        try:
+            return float(raw)
+        except Exception:
+            pass
+
+    return None
 
 
 def parse_shareholding(html):
     """
-    Parse FII and DII from the Shareholding Pattern table.
-    Gets the most recent quarter (last column).
+    Extract FII and DII from Shareholding Pattern table (most recent quarter).
     """
     result = {}
+    for label, key in [("FIIs", "fiiholding"), ("DIIs", "diiholding")]:
+        # Find the label and extract td values from its row
+        idx = html.find(">" + label + " ")
+        if idx == -1:
+            idx = html.find(">" + label + "<")
+        if idx == -1:
+            continue
 
-    for label, key in [("FIIs", "fiiholding"), ("DIIs", "diiholding"),
-                        ("FII", "fiiholding"), ("DII", "diiholding")]:
-        if key in result:
+        # Go backwards to find start of <tr>
+        tr_start = html.rfind('<tr', 0, idx)
+        if tr_start == -1:
             continue
-        values = parse_table_row(html, label)
-        if not values:
+        tr_end = html.find('</tr>', idx)
+        if tr_end == -1:
             continue
-        # Skip label cell, get last numeric value (most recent quarter)
-        for v in reversed(values):
-            cleaned = v.replace('%', '').replace(',', '').strip()
+
+        row = html[tr_start:tr_end]
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
+        # Get last cell (most recent quarter)
+        for cell in reversed(cells):
+            raw = re.sub(r'<[^>]+>', '', cell).replace('%', '').strip()
             try:
-                num = float(cleaned)
-                if 0 < num < 100:
-                    result[key] = num
+                v = float(raw)
+                if 0 < v < 100:
+                    result[key] = v
                     break
             except Exception:
                 pass
-
-    return result
-
-
-def parse_compounded_tables(html):
-    """
-    Parse the compounded growth and return-on-equity boxes at the bottom of P&L.
-    Structure:
-      <h2>Compounded Sales Growth</h2>
-      <table>
-        <tr><td>10 Years:</td><td>15%</td></tr>
-        <tr><td>5 Years:</td><td>18%</td></tr>
-        <tr><td>3 Years:</td><td>6%</td></tr>
-        <tr><td>TTM:</td><td>10%</td></tr>
-      </table>
-    """
-    result = {}
-
-    sections = {
-        "Compounded Sales Growth":   {"10 Years": "salesgrowth10y", "5 Years": "salesgrowth5y",
-                                       "3 Years": "salesgrowth3y"},
-        "Compounded Profit Growth":  {"10 Years": "profitgrowth10y", "5 Years": "profitgrowth5y",
-                                       "3 Years": "profitgrowth3y"},
-        "Stock Price CAGR":          {"10 Years": "cagr10y", "5 Years": "cagr5y",
-                                       "3 Years": "cagr3y"},
-        "Return on Equity":          {"10 Years": "roe10yr", "5 Years": "roe5yr",
-                                       "3 Years": "roe3yr"},
-    }
-
-    for section_title, metric_map in sections.items():
-        idx = html.find(section_title)
-        if idx == -1:
-            continue
-        # Get the table right after this heading (within 1000 chars)
-        chunk = html[idx:idx+1500]
-        table_m = re.search(r'<table[^>]*>(.*?)</table>', chunk, re.S | re.I)
-        if not table_m:
-            continue
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_m.group(1), re.S | re.I)
-        for row in rows:
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S | re.I)
-            if len(cells) < 2:
-                continue
-            label = re.sub(r'<[^>]+>', '', cells[0]).strip()
-            value_raw = re.sub(r'<[^>]+>', '', cells[1]).replace('%', '').replace(',', '').strip()
-            for period, key in metric_map.items():
-                if period.lower() in label.lower():
-                    try:
-                        result[key] = float(value_raw)
-                    except Exception:
-                        pass
 
     return result
 
@@ -321,20 +314,17 @@ def get_all_ratios(ticker):
     if not html:
         return {}
 
-    # 1. Top-ratios (9 confirmed correct default metrics)
+    # 1. Top-ratios (confirmed correct)
     result = parse_li_items(extract_ul_section(html, "top-ratios"))
 
-    # 2. Compounded growth tables from P&L section (Sales/Profit Growth, CAGR, ROE averages)
-    compound = parse_compounded_tables(html)
-    result.update(compound)
+    # 2. Growth tables via ranges-table class
+    result.update(parse_ranges_tables(html))
 
-    # 3. ROE 3Yr from insights (confirmed accurate — override if better)
-    insights_roe = parse_roe_from_insights(html)
-    result.update(insights_roe)
+    # 3. ROE 3Yr from insights (more precise than rounded ranges-table)
+    result.update(parse_roe_from_insights(html))
 
-    # 4. FII/DII from Shareholding table
-    shareholding = parse_shareholding(html)
-    result.update(shareholding)
+    # 4. FII/DII from shareholding table
+    result.update(parse_shareholding(html))
 
     return result
 
@@ -375,15 +365,14 @@ def stock():
     if not html:
         return jsonify({"error": "Could not fetch Screener"}), 503
 
-    # TTM financials from P&L table
     if metric == "SALESTTM":
-        v = parse_ttm_from_pl(html, "Sales")
-        return jsonify({"value": v if v is not None else "N/A"})
-    if metric == "PATTTM":
-        v = parse_ttm_from_pl(html, "Net Profit")
+        v = parse_annual_ttm(html, "Sales")
         return jsonify({"value": v if v is not None else "N/A"})
 
-    # ROCE by FY from Ratios table
+    if metric == "PATTTM":
+        v = parse_annual_ttm(html, "Net Profit")
+        return jsonify({"value": v if v is not None else "N/A"})
+
     if metric in ("ROCE2023", "ROCE2024", "ROCE2025"):
         v = parse_roce_by_year(html, metric.replace("ROCE", ""))
         return jsonify({"value": v if v is not None else "N/A"})
@@ -412,35 +401,21 @@ def debug_labels():
 
     ratios      = get_all_ratios(ticker)
     values      = {k: v for k, v in ratios.items() if not k.startswith('_label_')}
-    compound    = parse_compounded_tables(html)
+    ranges      = parse_ranges_tables(html)
     shareholding = parse_shareholding(html)
     roce2023    = parse_roce_by_year(html, "2023")
     roce2024    = parse_roce_by_year(html, "2024")
     roce2025    = parse_roce_by_year(html, "2025")
-    sales_ttm   = parse_ttm_from_pl(html, "Sales")
-    pat_ttm     = parse_ttm_from_pl(html, "Net Profit")
+    sales_ttm   = parse_annual_ttm(html, "Sales")
+    pat_ttm     = parse_annual_ttm(html, "Net Profit")
 
     return jsonify({
-        "all_values":    values,
-        "compound_tables": compound,
+        "values":        values,
+        "ranges_tables": ranges,
         "shareholding":  shareholding,
         "roce_by_year":  {"2023": roce2023, "2024": roce2024, "2025": roce2025},
         "ttm":           {"sales": sales_ttm, "pat": pat_ttm},
     })
-
-
-@app.route("/debug-raw-row")
-def debug_raw_row():
-    """Show raw cells from any table row by label"""
-    ticker = request.args.get("ticker", "RELIANCE").upper()
-    label  = request.args.get("label", "ROCE %")
-    html   = fetch_screener(ticker)
-    if not html:
-        return jsonify({"error": "no html"})
-    values = parse_table_row(html, label)
-    idx    = html.find(label)
-    context = html[max(0,idx-200):idx+500] if idx != -1 else "not found"
-    return jsonify({"label": label, "parsed_values": values, "context": context})
 
 
 @app.route("/clear-cache")
